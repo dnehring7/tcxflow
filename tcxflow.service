@@ -1,0 +1,25 @@
+[Unit]
+Description=tcxflow eBPF-based IPFIX flow accounting
+Documentation=https://github.com/dnehring7/tcxflow
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/sbin/tcxflow --config /etc/tcxflow/tcxflow.conf
+RuntimeDirectory=tcxflow
+Restart=always
+RestartSec=5
+CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_PERFMON CAP_SYS_ADMIN
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelModules=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=net
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

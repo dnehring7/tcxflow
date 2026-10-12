@@ -1,0 +1,16 @@
+/tcxflow
+/build/
+/.lint/
+/docs/
+/stage/
+*.o
+*.d
+*.tar.gz
+compile_commands.json
+# dpkg-buildpackage; debian/changelog is written by the release workflow
+/debian/changelog
+/debian/tcxflow/
+/debian/.debhelper/
+/debian/files
+/debian/*.substvars
+/debian/*debhelper*

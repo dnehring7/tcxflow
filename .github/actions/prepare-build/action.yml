@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Dirk Nehring <dnehring@gmx.net>
+#
+# Validate the vX.Y.Z tag, check that the checked-out code is at that version (src/util.h,
+# tcxflow.spec), and export V (= tag without leading "v") to $GITHUB_ENV/$GITHUB_OUTPUT.
+
+name: Prepare build
+description: Validate the vX.Y.Z tag against the code and export the version
+
+inputs:
+  tag:
+    description: 'Git tag (vX.Y.Z)'
+    required: true
+
+outputs:
+  version:
+    description: 'Version without leading "v"'
+    value: ${{ steps.init.outputs.V }}
+
+runs:
+  using: composite
+  steps:
+    - id: init
+      shell: bash
+      env:
+        TAG: ${{ inputs.tag }}
+      run: |
+        [[ "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+          || { echo "::error::Tag '${TAG}' does not match vX.Y.Z"; exit 1; }
+        grep -q "^#define TCXFLOW_VERSION \"${TAG}\"" src/util.h \
+          || { echo "::error::src/util.h is not at ${TAG}"; exit 1; }
+        grep -q "^Version: *${TAG#v}\$" tcxflow.spec \
+          || { echo "::error::tcxflow.spec is not at ${TAG#v}"; exit 1; }
+        echo "V=${TAG#v}" | tee -a "${GITHUB_OUTPUT}" "${GITHUB_ENV}" >/dev/null

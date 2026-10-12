@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Dirk Nehring <dnehring@gmx.net>
+#
+# clang-tidy configuration for tcxflow (C17 userspace + BPF program)
+
+HeaderFilterRegex: '(src|tests)/.*\.h$'
+SystemHeaders: false
+WarningsAsErrors: '*'
+FormatStyle: file
+
+Checks: >
+  -*,
+  bugprone-*,
+  cert-*,
+  clang-analyzer-*,
+  misc-*,
+  performance-*,
+  portability-*,
+  readability-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-implicit-widening-of-multiplication-result,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+  -readability-braces-around-statements,
+  -readability-function-cognitive-complexity,
+  -readability-identifier-length,
+  -readability-implicit-bool-conversion,
+  -readability-magic-numbers
+
+CheckOptions:
+  # Kernel and glibc internals without an IWYU mapping to the public header.
+  misc-include-cleaner.IgnoreHeaders: 'getopt\.h;bits/getopt_.*\.h;asm-generic/.*\.h;asm/.*\.h;bits/.*\.h'

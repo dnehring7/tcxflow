@@ -1,0 +1,25 @@
+Source: tcxflow
+Section: net
+Priority: optional
+Maintainer: Dirk Nehring <dnehring@gmx.net>
+Build-Depends: debhelper-compat (= 13),
+               clang,
+               libbpf-dev (>= 1:1.3),
+               pkg-config
+Standards-Version: 4.7.4
+Homepage: https://github.com/dnehring7/tcxflow
+Vcs-Git: https://github.com/dnehring7/tcxflow.git
+Vcs-Browser: https://github.com/dnehring7/tcxflow
+Rules-Requires-Root: no
+
+Package: tcxflow
+Architecture: amd64
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: lightweight eBPF-based IPFIX flow accounting
+ tcxflow meters the traffic of selected network interfaces with a small eBPF
+ program on the kernel's tcx hook and exports the flows as IPFIX (RFC 7011)
+ to one or more collectors.
+ .
+ It replaces ipt_NETFLOW on modern systems: no out-of-tree kernel module, no
+ iptables or nftables rules, and it works on routers whose interfaces live in
+ a separate network namespace.

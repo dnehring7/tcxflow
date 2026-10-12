@@ -1,0 +1,16 @@
+#!/usr/bin/make -f
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Dirk Nehring <dnehring@gmx.net>
+
+# All hardening, bindnow included: tcxflow runs with high privileges.
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+%:
+	dh $@
+
+override_dh_auto_install:
+	dh_auto_install -- PREFIX=/usr
+
+# Installed disabled: the example configuration has to be edited first.
+override_dh_installsystemd:
+	dh_installsystemd --no-enable

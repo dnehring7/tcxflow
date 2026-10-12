@@ -1,0 +1,31 @@
+# Doxyfile -- tcxflow
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Dirk Nehring <dnehring@gmx.net>
+
+PROJECT_NAME           = "tcxflow"
+PROJECT_BRIEF          = "Lightweight eBPF-based IPFIX flow accounting for Linux"
+OUTPUT_DIRECTORY       = docs
+
+INPUT                  = README.md src/
+FILE_PATTERNS          = *.c *.h
+USE_MDFILE_AS_MAINPAGE = README.md
+MARKDOWN_ID_STYLE      = GITHUB
+OPTIMIZE_OUTPUT_FOR_C  = YES
+HAVE_DOT               = NO
+
+# Every public entity is documented; the next undocumented one fails `make docs`.
+EXTRACT_ALL            = NO
+EXTRACT_STATIC         = NO
+WARN_IF_UNDOCUMENTED   = YES
+WARN_NO_PARAMDOC       = YES
+
+# Attributes and libbpf section names are not part of the documented API; the map
+# definitions are hidden with @cond in tcxflow.bpf.c.
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = YES
+PREDEFINED             = "__always_inline=" "__attribute__(x)=" "SEC(x)="
+
+GENERATE_LATEX         = NO
+SHOW_INCLUDE_FILES     = NO
+QUIET                  = YES
+WARN_AS_ERROR          = FAIL_ON_WARNINGS
