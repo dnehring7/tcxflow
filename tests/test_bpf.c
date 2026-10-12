@@ -13,7 +13,7 @@
 #include <fcntl.h>
 #include <linux/bpf.h>
 #include <linux/bpf_common.h>
-#include <linux/sockios.h>
+#include <linux/sockios.h> // IWYU pragma: keep (SIOCGIFFLAGS: glibc versions differ in where it comes from)
 #include <net/if.h>
 #include <netinet/in.h>
 #include <sched.h>
