@@ -23,7 +23,7 @@ WARN_NO_PARAMDOC       = YES
 # definitions are hidden with @cond in tcxflow.bpf.c.
 MACRO_EXPANSION        = YES
 EXPAND_ONLY_PREDEF     = YES
-PREDEFINED             = "__always_inline=" "__attribute__(x)=" "SEC(x)="
+PREDEFINED             = "__always_inline=" "SEC(x)="
 
 GENERATE_LATEX         = NO
 SHOW_INCLUDE_FILES     = NO

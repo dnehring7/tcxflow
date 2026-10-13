@@ -10,14 +10,20 @@
 #include <errno.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/types.h>
 #include <unistd.h>
 
-#define SNDBUF_SIZE (4 << 20) ///< socket send buffer, absorbs export bursts
-#define IPV4_UDP_HDRS 28      ///< IPv4 and UDP header bytes in front of an IPFIX message
-#define IPV6_UDP_HDRS 48      ///< IPv6 and UDP header bytes in front of an IPFIX message
+#include "util.h"
+
+static constexpr int SNDBUF_SIZE = 4 << 20;     ///< socket send buffer, absorbs export bursts
+static constexpr int IPV4_UDP_HDRS = 28;        ///< IPv4 and UDP header bytes in front of an IPFIX message
+static constexpr int IPV6_UDP_HDRS = 48;        ///< IPv6 and UDP header bytes in front of an IPFIX message
+static constexpr size_t TEMPLATE_MSG_MAX = 512; ///< buffer for a template message (IPFIX: 188 bytes)
 
 /* Copy n bytes of src into dst as a string; fails if empty or too long. */
 static int copy_part(char *dst, size_t dstlen, const char *src, size_t n) {
@@ -28,14 +34,14 @@ static int copy_part(char *dst, size_t dstlen, const char *src, size_t n) {
     return 0;
 }
 
-static int valid_port(const char *port) {
+static bool valid_port(const char *port) {
     unsigned long val = 0;
 
     if (!*port || strlen(port) > 5)
-        return 0;
+        return false;
     for (const char *p = port; *p; p++) {
         if (*p < '0' || *p > '9')
-            return 0;
+            return false;
         val = (val * 10) + (unsigned long)(*p - '0');
     }
     return val >= 1 && val <= 65535;
@@ -68,7 +74,7 @@ int collector_split(const char *spec, char *host, size_t hostlen, char *port, si
 }
 
 size_t collector_max_message(int fd) {
-    struct sockaddr_storage sa = {0};
+    struct sockaddr_storage sa = {};
     socklen_t salen = sizeof(sa);
     int mtu = 0;
     socklen_t mtulen = sizeof(mtu);
@@ -85,17 +91,54 @@ size_t collector_max_message(int fd) {
     return (size_t)mtu - IPV4_UDP_HDRS;
 }
 
-int collector_send(int fd, const void *msg, size_t len) {
-    if (send(fd, msg, len, MSG_DONTWAIT) >= 0)
-        return 0;
-    if (errno != ECONNREFUSED)
+static int send_templates(const struct collector *c, collector_templates_fn templates, void *ctx) {
+    uint8_t buf[TEMPLATE_MSG_MAX];
+    size_t n = 0;
+
+    for (unsigned i = 0; (n = templates(ctx, i, buf, sizeof(buf))) != 0; i++)
+        if (send(c->fd, buf, n, MSG_DONTWAIT) < 0)
+            return -1;
+    return 0;
+}
+
+int collector_export(struct collector *c, const void *msg, size_t len, collector_templates_fn templates, void *ctx) {
+    ssize_t n = 0;
+
+    if (c->templates_due && !send_templates(c, templates, ctx))
+        c->templates_due = false;
+    n = send(c->fd, msg, len, MSG_DONTWAIT);
+    if (n < 0 && errno == ECONNREFUSED) {
+        if (!c->refused)
+            log_msg("collector %s: port unreachable, the collector is down or restarting", c->name);
+        c->refused = true;
+        // While it is still down, the templates draw the next refusal, which this send then reports.
+        (void)send_templates(c, templates, ctx);
+        n = send(c->fd, msg, len, MSG_DONTWAIT);
+    }
+    if (n < 0) {
+        const int err = errno;
+
+        if (c->failing++ == 0 && !c->refused) // a refusal has been logged already
+            log_msg("collector %s: %s (counting the messages not sent)", c->name, strerror(err));
+        c->errors++;
+        c->templates_due = true;
+        errno = err;
         return -1;
-    return send(fd, msg, len, MSG_DONTWAIT) < 0 ? -1 : 1;
+    }
+    // One message for the end of an outage: the first that went out without a refusal.
+    if (c->failing)
+        log_msg("collector %s: reachable again, %llu messages not sent", c->name, (unsigned long long)c->failing);
+    else if (c->refused)
+        log_msg("collector %s: reachable again", c->name);
+    c->failing = 0;
+    c->refused = false;
+    c->sent++;
+    return 0;
 }
 
 int collector_open(const char *spec, char *err, size_t errlen) {
     struct addrinfo hints = {.ai_socktype = SOCK_DGRAM, .ai_flags = AI_NUMERICSERV};
-    struct addrinfo *ai = NULL;
+    struct addrinfo *ai = nullptr;
     char host[256];
     char port[8];
     int sndbuf = SNDBUF_SIZE;

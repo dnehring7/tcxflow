@@ -20,7 +20,6 @@
 #ifndef TCXFLOW_CONFIG_H
 #define TCXFLOW_CONFIG_H
 
-#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -30,11 +29,11 @@
 #endif
 #define CONFIG_DEFAULT_SOCKET "/run/tcxflow/tcxflow.sock" ///< default control socket
 
-#define CONFIG_MAX_IFACES 64    ///< interfaces at most
-#define CONFIG_MAX_COLLECTORS 8 ///< collectors at most
-#define CONFIG_NAME_MAX 16      ///< interface name buffer (IFNAMSIZ)
-#define CONFIG_STRING_MAX 256   ///< netns and collector address buffer
-#define CONFIG_SOCKET_MAX 108   ///< control socket path buffer (sizeof(sockaddr_un.sun_path))
+constexpr int CONFIG_MAX_IFACES = 64;     ///< interfaces at most
+constexpr int CONFIG_MAX_COLLECTORS = 8;  ///< collectors at most
+constexpr size_t CONFIG_NAME_MAX = 16;    ///< interface name buffer (IFNAMSIZ)
+constexpr size_t CONFIG_STRING_MAX = 256; ///< netns and collector address buffer
+constexpr size_t CONFIG_SOCKET_MAX = 108; ///< control socket path buffer (sizeof(sockaddr_un.sun_path))
 
 /** One metered interface. */
 struct iface_config {
@@ -50,9 +49,11 @@ struct config {
     char collectors[CONFIG_MAX_COLLECTORS][CONFIG_STRING_MAX]; /**< "host:port" or "[v6]:port" */
     int n_collectors;                                          /**< entries used in collectors */
     uint32_t observation_domain;                               /**< IPFIX observation domain id */
+    uint32_t template_refresh;                                 /**< templates at least every so many seconds */
     uint32_t inactive_timeout;                                 /**< seconds */
     uint32_t active_timeout;                                   /**< seconds */
     uint32_t max_flows;                                        /**< BPF flow table size per one-second interval */
+    uint32_t cache_flows;                                      /**< flows cached at most, 0 = 8 * max_flows */
     char socket[CONFIG_SOCKET_MAX];                            /**< control socket path */
 };
 
@@ -73,7 +74,7 @@ void config_init(struct config *cfg);
  * @param errlen  size of @p err
  * @return 0, or -1 with a message in @p err
  */
-int config_set(struct config *cfg, const char *key, const char *value, char *err, size_t errlen);
+[[nodiscard]] int config_set(struct config *cfg, const char *key, const char *value, char *err, size_t errlen);
 
 /**
  * Apply every option in @p fp, one per line; '#' starts a comment.
@@ -85,7 +86,7 @@ int config_set(struct config *cfg, const char *key, const char *value, char *err
  * @param errlen  size of @p err
  * @return 0, or -1 with a message in @p err
  */
-int config_read(struct config *cfg, FILE *fp, const char *name, char *err, size_t errlen);
+[[nodiscard]] int config_read(struct config *cfg, FILE *fp, const char *name, char *err, size_t errlen);
 
 /**
  * config_read() on a file.
@@ -96,7 +97,7 @@ int config_read(struct config *cfg, FILE *fp, const char *name, char *err, size_
  * @param errlen  size of @p err
  * @return 0, or -1 with a message in @p err
  */
-int config_load(struct config *cfg, const char *path, char *err, size_t errlen);
+[[nodiscard]] int config_load(struct config *cfg, const char *path, char *err, size_t errlen);
 
 /**
  * Check that at least one interface and one collector are configured.
@@ -106,6 +107,6 @@ int config_load(struct config *cfg, const char *path, char *err, size_t errlen);
  * @param errlen  size of @p err
  * @return 0, or -1 with a message in @p err
  */
-int config_validate(const struct config *cfg, char *err, size_t errlen);
+[[nodiscard]] int config_validate(const struct config *cfg, char *err, size_t errlen);
 
 #endif // TCXFLOW_CONFIG_H

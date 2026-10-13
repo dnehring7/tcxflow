@@ -23,6 +23,6 @@
  * @return process exit status: 0 after a normal stop; 1 on errors, a vanished interface or
  *         messages of the final export that could not be sent
  */
-int daemon_run(const struct config *cfg);
+[[nodiscard]] int daemon_run(const struct config *cfg);
 
 #endif // TCXFLOW_DAEMON_H

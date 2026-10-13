@@ -12,24 +12,27 @@ permissions:
   contents: read
 
 jobs:
-  # Formatting, clang-tidy, shellcheck, documentation, strict build, unit tests with sanitizers.
+  # Formatting, clang-tidy, shellcheck, documentation, strict build, unit tests with sanitizers;
+  # on Debian 13, the oldest supported toolchain (GCC 14, libbpf 1.5, Doxygen 1.9.8).
   lint:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
+    container: debian:trixie
     steps:
       - uses: actions/checkout@v7
       - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends make gcc clang libbpf-dev pkg-config doxygen shellcheck
-          pipx install clang-format==22.1.8
-          pipx install clang-tidy==22.1.8
+          apt-get update
+          apt-get install -y --no-install-recommends make gcc libc6-dev clang libbpf-dev bpftool pkg-config \
+            doxygen shellcheck pipx
+          PIPX_BIN_DIR=/usr/local/bin pipx install clang-format==22.1.8
+          PIPX_BIN_DIR=/usr/local/bin pipx install clang-tidy==22.1.8
       - run: make check
       - run: make docs
       - run: make clean && make SANITIZE=address test
 
-  # Strict build and unit tests on every supported distribution, with its own compiler and libbpf.
+  # Strict builds and unit tests on every supported distribution, with its own GCC, clang and libbpf.
   build:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
       matrix:
@@ -41,30 +44,33 @@ jobs:
         if: startsWith(matrix.image, 'debian')
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends make gcc libc6-dev clang libbpf-dev pkg-config
+          apt-get install -y --no-install-recommends make gcc libc6-dev clang libbpf-dev bpftool pkg-config
       - name: Install dependencies (Fedora)
         if: startsWith(matrix.image, 'fedora')
-        run: dnf install -y make gcc clang libbpf-devel pkgconf-pkg-config
+        run: dnf install -y make gcc clang libbpf-devel bpftool pkgconf-pkg-config
       - name: Install dependencies (AlmaLinux, libbpf-devel is in CRB)
         if: startsWith(matrix.image, 'almalinux')
-        run: dnf install -y --enablerepo=crb make gcc clang libbpf-devel pkgconf-pkg-config
+        run: dnf install -y --enablerepo=crb make gcc clang libbpf-devel bpftool pkgconf-pkg-config
       - run: make dev
       - run: make DEV_WARNINGS=1 test
+      - run: make clean && make CC=clang dev
+      - run: make CC=clang DEV_WARNINGS=1 test
       - run: make clean && make
       - run: ./tcxflow -V
       - run: ./tcxflow --config tcxflow.conf check
       - run: make install DESTDIR="$PWD/stage" && find stage -type f
 
-  # BPF program and end-to-end tests on the runner's kernel (needs root), also with sanitizers.
+  # BPF program and end-to-end tests on the runner's kernel (needs root), also with sanitizers;
+  # built with Ubuntu 26.04's GCC 15, clang 21 and libbpf 1.6.
   kernel:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            make gcc clang libbpf-dev pkg-config nfdump iperf3
+            make gcc clang libbpf-dev bpftool pkg-config nfdump iperf3
       - run: uname -r
       - run: make
       - run: sudo make test-bpf

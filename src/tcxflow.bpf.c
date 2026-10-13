@@ -25,22 +25,23 @@
 
 #include "flow.h"
 
-#define IP_MF 0x2000         ///< more fragments flag of iphdr.frag_off
-#define IP_OFFSET 0x1fff     ///< fragment offset bits of iphdr.frag_off
-#define ECN_MASK 0x03        ///< ECN bits of the TOS / traffic class byte
-#define VLAN_MAX 2           ///< VLAN tags in the packet parsed at most (QinQ)
-#define VLAN_VID_MASK 0x0fff ///< VLAN ID bits of a tag control information field
-#define IPV6_EXT_MAX 6       ///< IPv6 extension headers parsed: each once, destination options twice
-#define BIG_LEN 65535        ///< longest packet a length field can describe
-#define NEXTHDR_HOP 0        ///< IPv6 hop-by-hop options header
-#define NEXTHDR_ROUTING 43   ///< IPv6 routing header
-#define NEXTHDR_FRAG 44      ///< IPv6 fragment header
-#define NEXTHDR_AUTH 51      ///< IPv6 authentication header
-#define NEXTHDR_DEST 60      ///< IPv6 destination options header
-#define PROTO_ICMPV6 58      ///< IPPROTO_ICMPV6
+static constexpr __u16 IP_MF = 0x2000;         ///< more fragments flag of iphdr.frag_off
+static constexpr __u16 IP_OFFSET = 0x1fff;     ///< fragment offset bits of iphdr.frag_off
+static constexpr __u8 ECN_MASK = 0x03;         ///< ECN bits of the TOS / traffic class byte
+static constexpr int VLAN_MAX = 2;             ///< VLAN tags in the packet parsed at most (QinQ)
+static constexpr __u16 VLAN_VID_MASK = 0x0fff; ///< VLAN ID bits of a tag control information field
+static constexpr int IPV6_EXT_MAX = 6;         ///< IPv6 extension headers parsed: each once, destination options twice
+static constexpr __u32 BIG_LEN = 65535;        ///< longest packet a length field can describe
+static constexpr int CAS_TRIES = 8;            ///< compare-and-swap attempts on a timestamp before giving up
+static constexpr __u8 NEXTHDR_HOP = 0;         ///< IPv6 hop-by-hop options header
+static constexpr __u8 NEXTHDR_ROUTING = 43;    ///< IPv6 routing header
+static constexpr __u8 NEXTHDR_FRAG = 44;       ///< IPv6 fragment header
+static constexpr __u8 NEXTHDR_AUTH = 51;       ///< IPv6 authentication header
+static constexpr __u8 NEXTHDR_DEST = 60;       ///< IPv6 destination options header
+static constexpr __u8 PROTO_ICMPV6 = 58;       ///< IPPROTO_ICMPV6
 
-_Static_assert(sizeof(struct flow_key) == 56, "flow_key layout");
-_Static_assert(sizeof(struct flow_val) == 40, "flow_val layout");
+static_assert(sizeof(struct flow_key) == 56, "flow_key layout");
+static_assert(sizeof(struct flow_val) == 40, "flow_val layout");
 
 /*
  * Maps: flows0 and flows1 hold the flows of one interval each, active[0] points to the one
@@ -88,11 +89,11 @@ struct {
  * running kernel's BTF. bpf_cast_to_kern_ctx() makes them readable; the verifier turns the call
  * into a register copy.
  */
-struct sk_buff {
+struct [[clang::preserve_access_index]] sk_buff {
     unsigned char *head;
     unsigned char *data;
     __u16 network_header;
-} __attribute__((preserve_access_index));
+};
 
 extern void *bpf_cast_to_kern_ctx(void *obj) __ksym;
 /// @endcond
@@ -110,7 +111,25 @@ static __always_inline void count(__u32 idx, __u64 n, __u32 idx2, __u64 n2) {
 
 static __always_inline void count_one(__u32 idx) { count(idx, 1, idx, 0); }
 
-static __always_inline int ipv6_ext(__u8 nh) {
+/*
+ * Move a timestamp forward (later) or backward (earlier) to now. Another CPU can store between the
+ * read and the compare-and-swap: then try again from the value it stored, until ours sticks or
+ * the stored one is already beyond now.
+ */
+static __always_inline void cas_time(__u64 *t, __u64 now, bool later) {
+    __u64 seen = *t;
+
+#pragma unroll
+    for (int i = 0; i < CAS_TRIES && (later ? seen < now : now < seen); i++) {
+        const __u64 prev = __sync_val_compare_and_swap(t, seen, now);
+
+        if (prev == seen)
+            break;
+        seen = prev;
+    }
+}
+
+static __always_inline bool ipv6_ext(__u8 nh) {
     return nh == NEXTHDR_HOP || nh == NEXTHDR_ROUTING || nh == NEXTHDR_DEST || nh == NEXTHDR_FRAG || nh == NEXTHDR_AUTH;
 }
 
@@ -121,31 +140,30 @@ static __always_inline int ipv6_ext(__u8 nh) {
  */
 #define LOAD(off, dst) bpf_skb_load_bytes(skb, (off), (dst), sizeof(*(dst)))
 
-static __always_inline int account(struct __sk_buff *skb, __u8 dir) {
+static __always_inline int account(struct __sk_buff *skb, enum flow_dir dir) {
     const struct sk_buff *kskb = bpf_cast_to_kern_ctx(skb);
-    struct flow_key key;
-    struct flow_val *val = NULL;
+    struct flow_key key = {};
+    struct flow_val *val = nullptr;
     __be16 proto = (__be16)skb->protocol; // the upper 16 bits are always 0
     __u32 off = 0;
     __u32 l4off = 0;
     __u32 hdrs = 0;
+    __u32 transient = 0;
     __u32 tcpfl = 0;
     __u32 need = 0;
     __u32 zero = 0;
     __u64 headroom = 0;
     __u64 l3len = 0;
     __u64 end = 0;
-    __u64 seen = 0;
     __u64 pkts = 0;
     __u64 bytes = 0;
     __u64 now = 0;
     __u8 l4proto = 0;
     __u8 ecn = 0;
+    // int, not bool: clang builds 7% more instructions around bool flags here, 2-3 ns per packet.
     int has_l4 = 1;
     int first_frag = 0;
-    void *flows = NULL;
-
-    __builtin_memset(&key, 0, sizeof(key));
+    void *flows = nullptr;
 
     // Offsets count from skb->data, like skb->len, so that the lengths in the IP header can be
     // checked against the bytes really there. tc runs with skb->data at the link layer header, or
@@ -224,10 +242,24 @@ static __always_inline int account(struct __sk_buff *skb, __u8 dir) {
         l3len = bpf_ntohs(ip6.payload_len) + sizeof(ip6);
         l4off = off + sizeof(ip6);
         nh = ip6.nexthdr;
-        // Payload length 0 is a real empty payload, except for BIG TCP super-packets.
-        if (!ip6.payload_len && skb->gso_size && skb->len - off > BIG_LEN)
-            l3len = skb->len - off;
-        else if (l3len > skb->len - off)
+        // Payload length 0: an empty payload, a jumbogram (RFC 2675) or a BIG TCP super-packet. The
+        // last two carry the length in a Jumbo Payload option, except BIG TCP of newer kernels.
+        if (!ip6.payload_len) {
+            __u8 jh[8]; // a Hop-by-Hop header with just that option: next, length 0, type, 4, length
+
+            if (nh == NEXTHDR_HOP && !LOAD(l4off, &jh) && jh[1] == 0 && jh[2] == IPV6_TLV_JUMBO && jh[3] == 4) {
+                l3len = sizeof(ip6) + (((__u32)jh[4] << 24) | ((__u32)jh[5] << 16) | ((__u32)jh[6] << 8) | jh[7]);
+                if (l3len <= sizeof(ip6) + BIG_LEN) // a jumbo length must exceed 65535
+                    goto trunc;
+                // Linux puts this header on its BIG TCP super-packets and removes it before
+                // segmentation: no segment on the wire carries it.
+                if (skb->gso_size && jh[0] == IPPROTO_TCP)
+                    transient = 8;
+            } else if (skb->gso_size && skb->len - off > BIG_LEN) {
+                l3len = skb->len - off;
+            }
+        }
+        if (l3len > skb->len - off)
             goto trunc;
 #pragma unroll
         for (int i = 0; i < IPV6_EXT_MAX; i++) {
@@ -245,9 +277,11 @@ static __always_inline int account(struct __sk_buff *skb, __u8 dir) {
                     break;
                 }
             } else if (nh == NEXTHDR_AUTH) {
-                l4off += (eh[1] + 2) * 4;
+                if (!eh[1]) // shorter than its SPI and sequence number (RFC 4302)
+                    goto trunc;
+                l4off += (eh[1] + 2U) * 4U;
             } else {
-                l4off += (eh[1] + 1) * 8;
+                l4off += (eh[1] + 1U) * 8U;
             }
             nh = eh[0];
             if (l4off > off + l3len)
@@ -307,9 +341,17 @@ static __always_inline int account(struct __sk_buff *skb, __u8 dir) {
             goto trunc;
         key.dport = bpf_htons((tc[0] << 8) | tc[1]);
     } else if (has_l4 && need) { // UDP, UDP-Lite, SCTP and DCCP start with the ports
-        __be16 ports[2];
+        __be16 ports[4];         // UDP: then its length and checksum
+        __u32 ulen = 0;
 
         if (LOAD(l4off, &ports))
+            goto trunc;
+        // The kernel drops UDP whose length is shorter than the header or longer than the IP
+        // payload. Length 0 in IPv6 means a jumbogram (RFC 2675); the length in a first fragment
+        // covers all fragments, in a GRO/GSO packet it is the stack's.
+        ulen = bpf_ntohs(ports[2]);
+        if (l4proto == IPPROTO_UDP &&
+            ((ulen < 8 && (ulen || key.ipver != 6)) || (ulen > end - l4off && !first_frag && !skb->gso_size)))
             goto trunc;
         key.sport = ports[0];
         key.dport = ports[1];
@@ -323,7 +365,7 @@ static __always_inline int account(struct __sk_buff *skb, __u8 dir) {
         pkts = (l3len - hdrs + skb->gso_size - 1) / skb->gso_size;
     if (!pkts)
         pkts = 1;
-    bytes = l3len + ((pkts - 1) * hdrs);
+    bytes = l3len - transient + ((pkts - 1) * (hdrs - transient));
 
     // Interfaces are part of the key: one record per interface and direction, like the NetFlow
     // of a hardware router, so the same traffic seen on two interfaces is never merged.
@@ -361,9 +403,7 @@ static __always_inline int account(struct __sk_buff *skb, __u8 dir) {
             return TCX_NEXT;
         }
         // Lost the race: the winner's clock reading may be later than this packet's.
-        seen = val->first_ns;
-        if (now < seen)
-            (void)__sync_val_compare_and_swap(&val->first_ns, seen, now);
+        cas_time(&val->first_ns, now, false);
     }
     // Atomic: one flow can be counted on several CPUs at once (egress of local traffic, RSS).
     __sync_fetch_and_add(&val->packets, pkts);
@@ -371,9 +411,8 @@ static __always_inline int account(struct __sk_buff *skb, __u8 dir) {
     // last_ns only moves forward: CPUs read the coarse clock at slightly different moments, and a
     // plain store could put an older time over a newer one, even before first_ns. The clock ticks
     // once per jiffy, so the compare-and-swap runs about once per jiffy per flow, not per packet.
-    seen = val->last_ns;
-    if (seen < now)
-        (void)__sync_val_compare_and_swap(&val->last_ns, seen, now);
+    if (val->last_ns < now)
+        cas_time(&val->last_ns, now, true);
     if ((val->tcp_flags | tcpfl) != val->tcp_flags) // flags rarely change: skip the atomic OR
         __sync_fetch_and_or(&val->tcp_flags, tcpfl);
     return TCX_NEXT;

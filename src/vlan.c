@@ -13,12 +13,12 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define VLAN_CONFIG "/proc/net/vlan/config" ///< per network namespace, exists while 8021q is loaded
-#define VLAN_ID_MAX 4094                    ///< highest valid VLAN ID
+#define VLAN_CONFIG "/proc/net/vlan/config"        ///< per network namespace, exists while 8021q is loaded
+static constexpr unsigned long VLAN_ID_MAX = 4094; ///< highest valid VLAN ID
 
 /* Strip blanks on both ends, in place. */
 static char *trim(char *s) {
-    char *end = NULL;
+    char *end = nullptr;
 
     while (*s == ' ' || *s == '\t')
         s++;
@@ -33,8 +33,8 @@ uint16_t vlan_parse(FILE *fp, const char *name, char *lower, size_t lowerlen) {
 
     while (fgets(line, sizeof(line), fp)) {
         char *bar1 = strchr(line, '|');
-        char *bar2 = bar1 ? strchr(bar1 + 1, '|') : NULL;
-        char *end = NULL;
+        char *bar2 = bar1 ? strchr(bar1 + 1, '|') : nullptr;
+        char *end = nullptr;
         unsigned long vid = 0;
 
         if (!bar2) // the two header lines

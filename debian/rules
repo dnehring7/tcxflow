@@ -11,6 +11,7 @@ export DEB_BUILD_MAINT_OPTIONS = hardening=+all
 override_dh_auto_install:
 	dh_auto_install -- PREFIX=/usr
 
-# Installed disabled: the example configuration has to be edited first.
+# Installed disabled: the example configuration has to be edited first. deb-systemd-invoke
+# starts no disabled unit; --no-start would also skip the restart after an upgrade.
 override_dh_installsystemd:
 	dh_installsystemd --no-enable

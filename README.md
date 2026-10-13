@@ -15,7 +15,7 @@ separate network namespace.
 - IPv4 and IPv6, including extension headers and fragments; ports of TCP, UDP, UDP-Lite, SCTP and DCCP.
 - VLAN-aware: 802.1Q and QinQ VLAN IDs are part of each flow and exported.
 - Works on any interface type: NICs, bonds, bridges, VLAN, VXLAN, WireGuard, mirror ports.
-- Counts what is on the wire: GRO/TSO packets as their real segments, layer 3 bytes.
+- Counts what is on the wire: GRO/TSO and BIG TCP packets as their real segments, layer 3 bytes.
 - Never drops or changes packets. It runs in front of other tcx programs, which cannot hide
   packets from it.
 - `tcxflow stats` and `tcxflow interfaces` query the running exporter.
@@ -26,17 +26,19 @@ separate network namespace.
 
 | Distribution | Kernel | Build dependencies |
 |---|---|---|
-| Debian 13 (trixie) and later | 6.12 | `apt install make gcc clang libbpf-dev pkg-config` |
-| Fedora 44 and later | ≥ 6.12 | `dnf install make gcc clang libbpf-devel pkgconf-pkg-config` |
-| AlmaLinux 10 and later | 6.12 | `dnf install make gcc clang libbpf-devel pkgconf-pkg-config` (libbpf-devel is in CRB, enabled by default since 10.1) |
+| Debian 13 (trixie) and later | 6.12 | `apt install make gcc clang libbpf-dev bpftool pkg-config` |
+| Fedora 44 and later | ≥ 6.12 | `dnf install make gcc clang libbpf-devel bpftool pkgconf-pkg-config` |
+| AlmaLinux 10 and later | 6.12 | `dnf install make gcc clang libbpf-devel bpftool pkgconf-pkg-config` (libbpf-devel is in CRB, enabled by default since 10.1) |
 
 In general: Linux ≥ 6.6 (tcx) with BTF (`CONFIG_DEBUG_INFO_BTF`, enabled by all of the
-distributions above) and libbpf ≥ 1.3. tcxflow runs as root, or with `CAP_BPF`, `CAP_NET_ADMIN`,
+distributions above) and libbpf ≥ 1.5. Building needs a C23 compiler (GCC ≥ 14 or clang ≥ 19),
+clang ≥ 19 for the BPF program, and bpftool. tcxflow runs as root, or with `CAP_BPF`, `CAP_NET_ADMIN`,
 `CAP_PERFMON` (the BPF program reads the packet's network header offset from the kernel) and,
 for `netns`, `CAP_SYS_ADMIN`.
 
 Tested with Debian 13 (GCC 14.2, clang 19, libbpf 1.5), AlmaLinux 10.2 (GCC 14.3, clang 21,
-libbpf 1.7) and Fedora 44 (GCC 16.2, clang 22, libbpf 1.6.3).
+libbpf 1.7) and Fedora 44 (GCC 16.2, clang 22, libbpf 1.6.3), built with GCC and with clang, on
+their kernels 6.12 and 7.2, and with Debian 13 on mainline Linux 6.6.
 
 ## Installation
 
@@ -59,7 +61,7 @@ sudo dnf install tcxflow
 
 The packages install `/usr/sbin/tcxflow`, the systemd unit and `/etc/tcxflow/tcxflow.conf`.
 The service is not enabled: edit the configuration first (see below). `tcxflow --version`
-prints the version, for example `tcxflow v1.0.0`.
+prints the version.
 
 ### From source
 
@@ -110,7 +112,9 @@ active-timeout   120
 | `inactive-timeout` | export a flow after this many seconds without packets (1–86400) | 15 |
 | `active-timeout` | export long-running flows at least this often, in seconds (1–604800) | 1800 |
 | `max-flows` | BPF flow table size per one-second interval (1024–16777216) | 131072 |
+| `cache-flows` | flows cached until they end, at most (1024–134217728) | 8 × `max-flows` |
 | `observation-domain` | IPFIX observation domain id (0–4294967295) | 1 |
+| `template-refresh` | send the IPFIX templates at least this often, in seconds (1–86400) | 60 |
 | `socket` | control socket for `stats` and `interfaces`, an absolute path | `/run/tcxflow/tcxflow.sock` |
 
 `option value` and `option = value` are both accepted, and `#` starts a comment.
@@ -131,7 +135,7 @@ Options only for the command line:
 |---|---|
 | `-c`, `--config FILE` | read this configuration file instead of `/etc/tcxflow/tcxflow.conf`, always |
 | `-v`, `--verbose` | also show libbpf's informational and debug messages |
-| `-V`, `--version` | print the version (`tcxflow v1.0.0`) and exit |
+| `-V`, `--version` | print the version and exit |
 | `-h`, `--help` | show the options and exit |
 
 ## Commands
@@ -153,7 +157,7 @@ a metered interface or the namespace that disappears, flow maps that cannot be d
 
 ```
 $ sudo tcxflow stats
-version            v1.0.0
+version            v1.1.0
 uptime             3h 12m 5s
 cpu                41.718 s (0.362% of one CPU), max RSS 14212 KiB
 tick               last 1873 us, max 9541 us
@@ -164,6 +168,7 @@ bytes              712398123456
 ignored            12 non-IP, 0 malformed
 lost               0 packets, 0 bytes (flow table full, max_flows 131072)
 flows cached       5321 (at most 1048576)
+cache memory       7616 KiB allocated
 flows uncached     0 (cache full: exported at once)
 flows exported     1288210
 ipfix messages     59102
@@ -175,10 +180,12 @@ eth0                  4 -         in+out    attached      512339871     40192384
 eth1.100              7 100       in        attached       10272231       8019220177              0                0
 ```
 
-`stats` and `interfaces` talk to the running exporter over the control socket; they
-need the same privileges as the socket (root by default). `cpu` and `tick` show what
-tcxflow itself costs: its CPU time since the start, and how long the once-per-second work
-took.
+`stats` and `interfaces` talk to the running exporter over the control socket; they need the
+same privileges as the socket (root by default). A lock file next to it keeps a second tcxflow
+from starting, and tcxflow never replaces a socket another program listens on; one left behind
+by a crashed tcxflow is replaced. `cpu` and `tick` show what tcxflow itself costs: its CPU time
+since the start, and how long the once-per-second work took. `cache memory` is what the flow
+cache has allocated: it stays at its largest size, up to `cache-flows`.
 
 ## How it works
 
@@ -218,21 +225,23 @@ What it costs:
 ### The end-to-end test
 
 `sudo make test-e2e` (`tests/e2e.sh`) builds a small routed network out of network
-namespaces, runs tcxflow with `netns` and two nfcapd collectors as IPFIX sinks, and checks
-the decoded records against traffic with known counts:
+namespaces, runs tcxflow in a management namespace with `netns` and two nfcapd collectors as
+IPFIX sinks, and checks the decoded records against traffic with known counts:
 
 - ICMP, UDP, IPv6 and router-originated traffic: exact packet and byte counts;
 - VLAN 300 and QinQ 400/500 on a trunk and on a VLAN interface: the right VLAN IDs;
 - a 50 MB TCP transfer: exactly the segments the kernel sent, retransmissions included;
 - a long flow: split by the active timeout into several records that add up exactly;
-- `tcxflow stats` and `tcxflow interfaces`, identical records at both collectors;
+- `tcxflow stats` and `tcxflow interfaces`; both collectors received the same records, field
+  by field; tcxflow stops with status 0;
 - a second tcxflow on the same control socket: it must refuse to start;
+- a collector that restarts: it must decode the first message it gets afterwards;
 - replacing a metered interface by one with the same name and index, and deleting the
   namespace, under a running tcxflow: it must exit with status 1 both times.
 
-The namespaces get unique names and the collectors random ports, so the test is safe on a
-live host. Set `TCXFLOW=` to run another binary, for example a wrapper that starts tcxflow
-under valgrind.
+The namespaces get unique names, and tcxflow and its collectors run in their own, so the test
+is safe on a live host. Set `TCXFLOW=` to run another binary, for example a wrapper that starts
+tcxflow under valgrind.
 
 ### What is exported
 
@@ -246,10 +255,14 @@ Two IPFIX templates are used, 256 for IPv4 and 257 for IPv6. Each record contain
 - `packetDeltaCount`, `octetDeltaCount`
 - `flowStartMilliseconds`, `flowEndMilliseconds`, `flowEndReason`
 
-Templates are repeated every 60 seconds and every 20 messages, and with the next message
-when a collector refused one (it was down or restarted) or a message could not be sent.
-Messages are sized to fit the path MTU towards every collector (284 to 1400 bytes), so
-exporting through a VPN or tunnel does not fragment them.
+Templates are repeated every 60 seconds (`template-refresh`) and every 20 messages, also while
+no flow ends. A collector that refused a message (it was down or restarted) gets them before
+that message is sent again, and one that missed a message before the next; the other
+collectors are not affected. tcxflow logs when a collector refuses or messages cannot be sent,
+and when it is reachable again. Messages are sized to fit the path MTU towards every collector
+(112 to 1400 bytes; 464 if it is unknown, for 512-byte packets as RFC 7011 asks), so exporting
+through a VPN or tunnel does not fragment them. Below 284 bytes the templates go in messages
+of their own.
 
 How the counting works:
 
@@ -267,13 +280,19 @@ How the counting works:
     Traffic the host sends itself has ingress interface 0.
 - **Flows end** after the inactive timeout, after the active timeout, 2 seconds after the
   last packet of a TCP connection that sent FIN or RST, or when tcxflow stops (`forcedEnd`),
-  always within one second of the timeout. SIGTERM, SIGINT and SIGHUP all export every cached
-  flow before tcxflow exits.
+  within about one second of the timeout. Packets that come after such a gap start a new
+  record, even if they arrive before the old one was exported: a new connection on the same
+  ports gets its own. SIGTERM, SIGINT and SIGHUP all export every cached flow before tcxflow
+  exits.
+- **Super-packets** (GRO, TSO, BIG TCP) count as the segments they become on the wire, each
+  with its own headers. The Jumbo Payload header Linux puts on IPv6 BIG TCP packets in the
+  stack is not on the wire and not counted; real IPv6 jumbograms (RFC 2675) count as they are.
 - **Fragments.** The first fragment of a datagram carries the ports and counts with them; the
   later ones form a flow without ports. An IPv4 first fragment that ends inside the transport
   header counts without ports too.
 - **Malformed packets** are not assigned to any flow: length fields that contradict the
-  headers or the frame, TCP data offsets below 5, IPv6 first fragments without the whole
+  headers or the frame, UDP lengths below 8 or beyond the IP payload, TCP data offsets below 5,
+  IPv6 Authentication Headers shorter than 12 bytes, IPv6 first fragments without the whole
   transport header. The kernel drops such packets, and their fields would be guesses.
   `tcxflow stats` counts them as `malformed`. IPv6 chains of more than 6 extension headers
   (each one once, destination options twice, as RFC 8200 recommends) count without ports, with
@@ -374,8 +393,9 @@ What matters for flow accounting:
 - **When the table is full,** packets of new flows in that second are not counted.
   They show up as `lost` in `tcxflow stats`, with a warning in the log. Size it for
   your busiest second, with headroom.
-- **The flow cache** in userspace holds the flows until they end, at most 8 × `max-flows`
-  (about 116 bytes each; 1 Mi flows and 116 MiB with the default). When it is full, for example during a
+- **The flow cache** in userspace holds the flows until they end, at most `cache-flows` (8 ×
+  `max-flows` by default; about 116 bytes each: 1 Mi flows and 116 MiB). Long quiet flows need
+  more of it than a busy second needs table slots, so the two are set apart. When it is full, for example during a
   flood with spoofed source addresses, flows that are not cached yet are exported every
   second with `flowEndReason` 5 (lack of resources) instead. Counts stay exact, but there
   are more records. `tcxflow stats` shows them as `flows uncached`.
@@ -386,7 +406,7 @@ What matters for flow accounting:
 |---|---|
 | `make` | build `./tcxflow` |
 | `make dev` | strict build of `tcxflow` and the tests: every warning is an error |
-| `make test` | unit tests: configuration, collector addresses, control socket, VLAN lookup, IPFIX encoding, flow cache (no root) |
+| `make test` | unit tests: configuration, collectors, control socket, VLAN lookup, IPFIX encoding, flow cache; the BPF program compiled natively for BIG TCP, jumbograms and races between CPUs (no root) |
 | `sudo make test-bpf` | BPF program tests: hand-built packets via `BPF_PROG_TEST_RUN` |
 | `sudo make test-e2e` | end-to-end test in network namespaces against nfdump (needs nfdump, iperf3) |
 | `sudo make test-all` | all three |
@@ -400,6 +420,9 @@ What matters for flow accounting:
 | `sudo make uninstall` | remove the binary and the unit |
 | `make clean` | remove everything the build created |
 
+- C23 (`-std=gnu23`) for tcxflow and the BPF program; the BPF program uses instruction set v4
+  (Linux 6.6). bpftool links the BPF object, dropping its DWARF but keeping the BTF, and
+  generates `build/tcxflow.skel.h`, which embeds the object and names its maps and programs.
 - `make dev` (or `DEV_WARNINGS=1` on any target) builds with `-Werror` and a long list of
   extra warnings (`-Wconversion`, `-Wshadow`, `-Wcast-qual`, `-Wformat=2`, …), the GCC static
   analyzer (`-fanalyzer`), `_FORTIFY_SOURCE=3` and stack protection. The BPF program is
@@ -410,15 +433,17 @@ What matters for flow accounting:
 - `make SANITIZE=address` builds with ASan and UBSan.
 - `CFLAGS`, `CPPFLAGS` and `LDFLAGS` belong to the packager (`make CFLAGS="$RPM_OPT_FLAGS"`);
   the flags tcxflow needs are added separately, so they cannot be overridden by accident.
-- CI formats and lints with clang-format and clang-tidy 22 (`pip install clang-format==22.1.8 clang-tidy==22.1.8`).
-- GitHub Actions (`.github/workflows/ci.yml`) runs `make check` and `make docs`, builds and unit-tests
-  on Debian 13, Fedora 44 and AlmaLinux 10, and runs the BPF and end-to-end tests on the runner's kernel.
+- CI formats and lints with clang-format and clang-tidy 22 (`pipx install clang-format==22.1.8 clang-tidy==22.1.8`).
+- GitHub Actions (`.github/workflows/ci.yml`, Ubuntu 26.04 runners) runs `make check` and
+  `make docs` on Debian 13 (the oldest supported toolchain), builds and unit-tests with GCC and
+  clang on Debian 13, Fedora 44 and AlmaLinux 10, and runs the BPF and end-to-end tests on the
+  runner itself (Linux 7.0, GCC 15, clang 21, libbpf 1.6).
 
 ### Releases and packages
 
-The version is in `src/util.h` (`TCXFLOW_VERSION`, for example `v1.0.0`, the same as the git
+The version is in `src/util.h` (`TCXFLOW_VERSION`, for example `v1.1.0`, the same as the git
 tag) and in `tcxflow.spec` (`Version`, without the `v`). To release, set both, commit, and push
-the tag, for example `v1.0.0`. Only such a tag starts `.github/workflows/release.yml`, which
+the tag, for example `v1.1.0`. Only such a tag starts `.github/workflows/release.yml`, which
 fails if the code is not at the version of the tag:
 
 - **ci**: all of `ci.yml`, including the BPF and end-to-end tests on the runner's kernel.
@@ -437,11 +462,11 @@ The packages also build by hand. `debian/changelog` is written by the release wo
 first:
 
 ```bash
-dch --create --package tcxflow --newversion 1.0.0 --distribution trixie 'Release 1.0.0'
-dpkg-buildpackage -us -uc -b            # ../tcxflow_1.0.0_amd64.deb
+dch --create --package tcxflow --newversion 1.1.0 --distribution trixie 'Release 1.1.0'
+dpkg-buildpackage -us -uc -b            # ../tcxflow_1.1.0_amd64.deb
 
-git archive --prefix=tcxflow-1.0.0/ -o tcxflow-1.0.0.tar.gz v1.0.0
-rpmbuild -ta tcxflow-1.0.0.tar.gz       # ~/rpmbuild/RPMS/x86_64/
+git archive --prefix=tcxflow-1.1.0/ -o tcxflow-1.1.0.tar.gz v1.1.0
+rpmbuild -ta tcxflow-1.1.0.tar.gz       # ~/rpmbuild/RPMS/x86_64/
 ```
 
 Source layout:
@@ -450,7 +475,7 @@ Source layout:
 |---|---|
 | `src/tcxflow.bpf.c` | BPF program (tcx ingress/egress) |
 | `src/flow.h` | flow key, counters and statistics shared with the BPF program |
-| `src/meter.c` | loads, attaches, swaps and drains the BPF side (libbpf) |
+| `src/meter.c` | loads, attaches, swaps and drains the BPF side (libbpf, through the skeleton bpftool generates) |
 | `src/cache.c` | flow cache with inactive, active and FIN timeouts |
 | `src/ipfix.c` | IPFIX message encoder |
 | `src/daemon.c` | the exporter loop and the control commands |
@@ -458,11 +483,11 @@ Source layout:
 | `src/config.c` | options and configuration file |
 | `src/collector.c` | collector addresses and sockets |
 | `src/vlan.c` | VLAN IDs of VLAN interfaces |
-| `src/bpfobj.c` | embeds the compiled BPF program into the binary |
 | `src/util.c` | logging and clocks |
 | `src/main.c` | command line |
 | `tests/test_unit.c` | unit tests |
 | `tests/test_bpf.c` | BPF program tests |
+| `tests/test_bpf_native.c` | the BPF program as ordinary C, with the helpers in `tests/native/` |
 | `tests/e2e.sh` | end-to-end test |
 | `debian/` | Debian package |
 | `tcxflow.spec` | RPM package |

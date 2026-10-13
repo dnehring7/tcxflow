@@ -7,16 +7,18 @@
 #   lan (10.10.1.2) --- [dp-lan   dp   dp-up] --- wan (192.0.2.2, 192.0.2.3)
 #                              [dp   trk] === wtrk   VLAN 300: 10.30.0.1 - 10.30.0.2
 #                                                              QinQ 400/500: 10.45.0.1 - 10.45.0.2
+#                              [dp  tcol] --- wan    quiet: the collector restart test
 #
-# "dp" plays the router's dataplane namespace. tcxflow runs in the root namespace with
-# "netns dp", meters dp-up, the trunk trk and its VLAN interface trk.300, and exports IPFIX from
-# the root namespace to two nfcapd collectors. The test sends traffic with known packet and byte
-# counts, then checks "tcxflow stats", "tcxflow interfaces" and the records nfdump decoded.
-# Finally it replaces a metered interface by one with the same name and index, and deletes "dp",
-# under a running tcxflow: both times it must exit with status 1.
+# "dp" plays the router's dataplane namespace, "mgmt" its management side. tcxflow runs in mgmt
+# with "netns dp", meters dp-up, the trunk trk and its VLAN interface trk.300, and exports IPFIX
+# to two nfcapd collectors in mgmt. The test sends traffic with known packet and byte counts, then
+# checks "tcxflow stats", "tcxflow interfaces" and the records nfdump decoded, and that a
+# restarted collector decodes the first message it gets. Finally it replaces a metered interface
+# by one with the same name and index, and deletes "dp", under a running tcxflow: both times it
+# must exit with status 1.
 #
-# The namespaces get unique names (tcxf<pid>-lan, ...) and the collectors random ports, so
-# the test can run on a live host without touching its own namespaces or services.
+# The namespaces get unique names (tcxf<pid>-lan, ...), and tcxflow and its collectors live in
+# their own: the test can run on a live host without touching its namespaces or services.
 #
 # Needs root, iproute2, nfdump (nfcapd), iperf3.   Usage: sudo tests/e2e.sh
 
@@ -29,8 +31,11 @@ NS=tcxf$$
 LAN=$NS-lan
 DP=$NS-dp
 WAN=$NS-wan
-PORT1=$((20000 + RANDOM % 20000))
-PORT2=$((PORT1 + 1))
+MGMT=$NS-mgmt
+TCX=(ip netns exec "$MGMT" "$TCXFLOW") # tcxflow on the management side
+PORT1=4739
+PORT2=4740
+PORT3=4741
 V6=0
 [[ -d /proc/sys/net/ipv6 ]] && V6=1
 FAIL=0
@@ -46,11 +51,12 @@ done
 cleanup() {
     kill "${PIDS[@]}" 2>/dev/null || true
     wait 2>/dev/null || true
-    for ns in "$LAN" "$DP" "$WAN"; do ip netns del "$ns" 2>/dev/null || true; done
+    for ns in "$LAN" "$DP" "$WAN" "$MGMT"; do ip netns del "$ns" 2>/dev/null || true; done
     rm -rf "$WORK"
 }
 trap cleanup EXIT
 
+# Background processes: ip netns exec itself, so that $! is the process and not a subshell.
 nsx() { ip netns exec "$@"; }
 # TCP segments sent by a namespace, including retransmissions
 # shellcheck disable=SC2016 # awk fields, not shell variables
@@ -59,7 +65,7 @@ ok() { printf 'ok    %s\n' "$1"; }
 # Wait until the daemon logged that it is attached (slow under valgrind or on a busy CI runner).
 wait_started() { # pid, log file
     for _ in {1..150}; do
-        grep -q ' started: ' "$2" && return 0
+        grep -qs ' started: ' "$2" && return 0 # the shell may not have created the log yet
         kill -0 "$1" 2>/dev/null || break
         sleep 0.1
     done
@@ -70,7 +76,7 @@ wait_started() { # pid, log file
 fail() { printf 'FAIL  %s\n' "$1"; FAIL=1; }
 
 # --- topology ----------------------------------------------------------------
-for ns in "$LAN" "$DP" "$WAN"; do ip netns add "$ns"; nsx "$ns" ip link set lo up; done
+for ns in "$LAN" "$DP" "$WAN" "$MGMT"; do ip netns add "$ns"; nsx "$ns" ip link set lo up; done
 ip link add lan0 netns "$LAN" type veth peer name dp-lan netns "$DP"
 ip link add wan0 netns "$WAN" type veth peer name dp-up netns "$DP"
 nsx "$LAN" ip addr add 10.10.1.2/24 dev lan0
@@ -126,12 +132,12 @@ active-timeout   2
 socket           $WORK/tcxflow.sock
 EOF
 mkdir "$WORK/c1" "$WORK/c2"
-nfcapd -b 127.0.0.1 -p "$PORT1" -w "$WORK/c1" >/dev/null 2>&1 &
+ip netns exec "$MGMT" nfcapd -b 127.0.0.1 -p "$PORT1" -w "$WORK/c1" >/dev/null 2>&1 &
 PIDS+=($!)
-nfcapd -b 127.0.0.1 -p "$PORT2" -w "$WORK/c2" >/dev/null 2>&1 &
+ip netns exec "$MGMT" nfcapd -b 127.0.0.1 -p "$PORT2" -w "$WORK/c2" >/dev/null 2>&1 &
 PIDS+=($!)
 sleep 1
-"$TCXFLOW" --config "$WORK/tcxflow.conf" >"$WORK/tcxflow.log" 2>&1 &
+"${TCX[@]}" --config "$WORK/tcxflow.conf" >"$WORK/tcxflow.log" 2>&1 &
 DAEMON=$!
 PIDS+=("$DAEMON")
 wait_started $DAEMON "$WORK/tcxflow.log"
@@ -140,7 +146,7 @@ wait_started $DAEMON "$WORK/tcxflow.log"
 LAN0=$(tcp_sent "$LAN")
 WAN0=$(tcp_sent "$WAN")
 # 35 pings over 7 seconds: with active-timeout 2 the flow is exported in several records
-nsx "$LAN" ping -c 35 -i 0.2 -q 192.0.2.3 >/dev/null &
+ip netns exec "$LAN" ping -c 35 -i 0.2 -q 192.0.2.3 >/dev/null &
 LONGPING=$!
 PIDS+=("$LONGPING")
 nsx "$LAN" ping -c 10 -i 0.2 -q 192.0.2.2 >/dev/null              # 10 x 84 bytes
@@ -152,7 +158,7 @@ nsx "$DP" ip neigh add 192.0.2.99 lladdr 02:00:00:00:00:99 dev dp-up nud permane
 nsx "$LAN" bash -c 'exec 3>/dev/udp/192.0.2.99/5000; for i in {1..1000}; do printf "%1000s" "" >&3; done'
 nsx "$DP" ping -c 4 -i 0.2 -q 10.30.0.2 >/dev/null # VLAN 300
 nsx "$DP" ping -c 3 -i 0.2 -q 10.45.0.2 >/dev/null # QinQ 400/500
-nsx "$WAN" iperf3 -s -1 >/dev/null 2>&1 & # not daemonized: a failed client must not leave it behind
+ip netns exec "$WAN" iperf3 -s -1 >/dev/null 2>&1 & # not daemonized: a failed client must not leave it behind
 PIDS+=($!)
 sleep 0.5
 nsx "$LAN" iperf3 -c 192.0.2.2 -n 50M >/dev/null # GSO/TSO traffic
@@ -162,8 +168,8 @@ wait $LONGPING
 sleep 1.5
 
 # --- query the running exporter ----------------------------------------------------
-STATS=$("$TCXFLOW" --config "$WORK/tcxflow.conf" stats)
-IFACES=$("$TCXFLOW" --config "$WORK/tcxflow.conf" interfaces)
+STATS=$("${TCX[@]}" --config "$WORK/tcxflow.conf" stats)
+IFACES=$("${TCX[@]}" --config "$WORK/tcxflow.conf" interfaces)
 PKTS=$(awk '$1 == "packets" {print $2}' <<<"$STATS")
 if [[ $PKTS -gt 30000 ]] && grep -q '^interfaces *3 attached, 0 gone' <<<"$STATS"; then
     ok "tcxflow stats: $PKTS packets accounted"
@@ -172,8 +178,8 @@ else
     echo "$STATS"
 fi
 # A second instance with the same control socket must refuse to start, and leave the first alone.
-if ! "$TCXFLOW" --config "$WORK/tcxflow.conf" >"$WORK/second.log" 2>&1 && grep -q 'already running' "$WORK/second.log" &&
-    kill -0 $DAEMON 2>/dev/null && "$TCXFLOW" --config "$WORK/tcxflow.conf" stats >/dev/null; then
+if ! "${TCX[@]}" --config "$WORK/tcxflow.conf" >"$WORK/second.log" 2>&1 && grep -q 'already running' "$WORK/second.log" &&
+    kill -0 $DAEMON 2>/dev/null && "${TCX[@]}" --config "$WORK/tcxflow.conf" stats >/dev/null; then
     ok "second instance refused, the first still answers"
 else
     fail "second instance"
@@ -189,7 +195,21 @@ fi
 
 sleep 3 # inactive timeout (2 s) + one interval: everything exported
 kill -TERM $DAEMON
-wait $DAEMON || true
+RC=0
+wait $DAEMON || RC=$?
+if [[ $RC == 0 ]]; then
+    ok "stopped with status 0: everything exported"
+else
+    fail "stopped with status $RC"
+    cat "$WORK/tcxflow.log"
+fi
+# The final export may still wait in a collector's socket buffer: a collector stopped before it
+# read it would miss records the other one has.
+for _ in {1..50}; do
+    queued=$(ip netns exec "$MGMT" ss -Hunl "( sport = :$PORT1 or sport = :$PORT2 )" | awk '{q += $2} END {print q + 0}')
+    [[ $queued == 0 ]] && break
+    sleep 0.1
+done
 kill "${PIDS[@]}" 2>/dev/null || true
 wait 2>/dev/null || true
 PIDS=()
@@ -235,17 +255,21 @@ VL=$(awk -F' : ' '/"src_vlan"/ {v = $2 + 0} /"cust_vlanID"/ {print v "/" $2 + 0}
 if [[ $VL == "400/500" ]]; then
     ok "QinQ in, trunk: VLAN 400, customer VLAN 500"
 elif ! grep -q '"cust_vlanID"' <<<"$JSON" && grep -q '"src_vlan" : 400,' <<<"$JSON"; then
-    ok "QinQ in, trunk: VLAN 400 (this nfdump does not decode the customer VLAN)"
+    ok "QinQ in, trunk: VLAN 400"
+    printf 'SKIP  QinQ in, trunk: customer VLAN 500 (this nfdump does not decode IPFIX 245)\n'
 else
     fail "QinQ in, trunk: VLAN/customer VLAN \"$VL\", expected 400/500"
     echo "$JSON"
 fi
-R1=$(nfdump -R "$WORK/c1" -q -o 'fmt:%pkt' | wc -l)
-R2=$(nfdump -R "$WORK/c2" -q -o 'fmt:%pkt' | wc -l)
-if [[ $R1 == "$R2" && $R1 -gt 0 ]]; then
+# Every record field by field, not just their number.
+FMT='fmt:%ts %te %pr %sa %da %sp %dp %in %out %svln %dvln %flg %pkt %byt'
+for c in c1 c2; do nfdump -R "$WORK/$c" -N -q -o "$FMT" | LC_ALL=C sort >"$WORK/$c.records"; done
+R1=$(wc -l <"$WORK/c1.records")
+if [[ $R1 -gt 0 ]] && cmp -s "$WORK/c1.records" "$WORK/c2.records"; then
     ok "both collectors received the same $R1 records"
 else
-    fail "collectors differ: $R1 vs $R2 records"
+    fail "collectors differ: $R1 vs $(wc -l <"$WORK/c2.records") records"
+    diff "$WORK/c1.records" "$WORK/c2.records" | head -10
 fi
 
 # Wait for a tcxflow that must exit with status 1 and log why. Args: pid, log, message, description.
@@ -267,6 +291,59 @@ expect_exit() {
     fi
 }
 
+# --- a collector restarts: it must decode the first message it gets, though nothing follows -----
+# A quiet interface: IPv6 off and a static neighbour, so the test's datagrams are its only flows,
+# and the first message after the restart is the one with the record checked.
+ip link add tcol netns "$DP" type veth peer name tcol-peer netns "$WAN"
+if ((V6)); then
+    nsx "$DP" sysctl -qw net.ipv6.conf.tcol.disable_ipv6=1
+    nsx "$WAN" sysctl -qw net.ipv6.conf.tcol-peer.disable_ipv6=1
+fi
+nsx "$DP" ip addr add 10.77.0.1/24 dev tcol
+nsx "$DP" ip link set tcol up
+nsx "$WAN" ip link set tcol-peer up
+nsx "$DP" ip neigh add 10.77.0.99 lladdr 02:00:00:00:00:99 dev tcol nud permanent
+cat >"$WORK/restart.conf" <<EOF
+netns            $DP
+interface        tcol:out
+collector        127.0.0.1:$PORT3
+inactive-timeout 1
+socket           $WORK/restart.sock
+EOF
+datagram() { nsx "$DP" bash -c "printf x >/dev/udp/10.77.0.99/$1"; } # 29 bytes
+mkdir "$WORK/before" "$WORK/after"
+ip netns exec "$MGMT" nfcapd -b 127.0.0.1 -p "$PORT3" -w "$WORK/before" >/dev/null 2>&1 &
+COLL=$!
+PIDS+=("$COLL")
+sleep 1
+"${TCX[@]}" --config "$WORK/restart.conf" >"$WORK/tcxflow-restart.log" 2>&1 &
+DAEMON=$!
+PIDS+=("$DAEMON")
+wait_started $DAEMON "$WORK/tcxflow-restart.log"
+datagram 65001
+sleep 3 # exported: the collector has the templates
+kill -TERM $COLL
+wait $COLL || true
+datagram 65002
+sleep 3 # exported into the void: the port unreachable error is now pending at tcxflow
+ip netns exec "$MGMT" nfcapd -b 127.0.0.1 -p "$PORT3" -w "$WORK/after" >/dev/null 2>&1 &
+COLL=$!
+PIDS+=("$COLL")
+sleep 1
+datagram 65003
+sleep 3 # the first message the restarted collector gets
+kill -TERM $DAEMON
+wait $DAEMON || true
+kill -TERM $COLL
+wait $COLL || true
+GOT=$(nfdump -R "$WORK/after" -N -q -o 'fmt:%pkt %byt' 'proto udp and dst port 65003' | awk '{p += $1; b += $2} END {print p + 0, b + 0}')
+if [[ $GOT == "1 29" ]] && grep -q 'collector 127.0.0.1:.*port unreachable' "$WORK/tcxflow-restart.log"; then
+    ok "collector restarted: it decoded the first message"
+else
+    fail "collector restarted: got \"$GOT\" of the record that came first, expected 1 29"
+    cat "$WORK/tcxflow-restart.log"
+fi
+
 # --- an interface replaced by one with the same name and index: the kernel detached tcxflow's
 # links from the old one, so nothing is metered any more; tcxflow must notice and exit ------
 nsx "$DP" ip link add trep type veth peer name trep-peer
@@ -277,7 +354,7 @@ interface trep
 collector 127.0.0.1:$PORT1
 socket    $WORK/replace.sock
 EOF
-"$TCXFLOW" --config "$WORK/replace.conf" >"$WORK/tcxflow-replace.log" 2>&1 &
+"${TCX[@]}" --config "$WORK/replace.conf" >"$WORK/tcxflow-replace.log" 2>&1 &
 DAEMON=$!
 PIDS+=("$DAEMON")
 wait_started $DAEMON "$WORK/tcxflow-replace.log"
@@ -287,7 +364,7 @@ printf 'link del trep\nlink add trep index %s type veth peer name trep-peer\n' "
 expect_exit $DAEMON "$WORK/tcxflow-replace.log" "interface trep is gone" "interface replaced (index $REP)"
 
 # --- the namespace is deleted: tcxflow must let go of it and exit with status 1 -----------
-"$TCXFLOW" --config "$WORK/tcxflow.conf" >"$WORK/tcxflow-netns.log" 2>&1 &
+"${TCX[@]}" --config "$WORK/tcxflow.conf" >"$WORK/tcxflow-netns.log" 2>&1 &
 DAEMON=$!
 PIDS+=("$DAEMON")
 wait_started $DAEMON "$WORK/tcxflow-netns.log"

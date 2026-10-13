@@ -17,13 +17,14 @@ void log_msg(const char *fmt, ...) {
 
     (void)fputs("tcxflow: ", stderr);
     va_start(ap, fmt);
-    (void)vfprintf(stderr, fmt, ap);
+    // clang-tidy 22 does not see C23's va_start (__builtin_c23_va_start) initialise ap.
+    (void)vfprintf(stderr, fmt, ap); // NOLINT(clang-analyzer-security.VAList)
     va_end(ap);
     (void)fputc('\n', stderr);
 }
 
 uint64_t clock_ns(clockid_t clk) {
-    struct timespec ts = {0};
+    struct timespec ts = {};
 
     (void)clock_gettime(clk, &ts);
     return ((uint64_t)ts.tv_sec * NSEC_PER_SEC) + (uint64_t)ts.tv_nsec;

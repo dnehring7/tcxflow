@@ -12,12 +12,12 @@
 
 #include <linux/types.h>
 
-#define FLOW_PROTO_ICMP 1    ///< IPPROTO_ICMP
-#define FLOW_PROTO_TCP 6     ///< IPPROTO_TCP
-#define FLOW_PROTO_ICMPV6 58 ///< IPPROTO_ICMPV6
+constexpr __u8 FLOW_PROTO_ICMP = 1;    ///< IPPROTO_ICMP
+constexpr __u8 FLOW_PROTO_TCP = 6;     ///< IPPROTO_TCP
+constexpr __u8 FLOW_PROTO_ICMPV6 = 58; ///< IPPROTO_ICMPV6
 
-/** Direction of a flow record relative to the metered interface. */
-enum flow_dir {
+/** Direction of a flow record relative to the metered interface; one byte, as in struct flow_key. */
+enum flow_dir : __u8 {
     FLOW_DIR_IN = 0,  /**< tcx ingress: packet received on the interface */
     FLOW_DIR_OUT = 1, /**< tcx egress: packet sent out of the interface */
 };
@@ -27,19 +27,19 @@ enum flow_dir {
  * addresses use the first 4 bytes of src/dst.
  */
 struct flow_key {
-    __u32 in_if;      /**< ingressInterface; 0 for packets sent by this host */
-    __u32 out_if;     /**< egressInterface; 0 on ingress (routing not done yet) */
-    __u8 src[16];     /**< source address */
-    __u8 dst[16];     /**< destination address */
-    __be16 sport;     /**< source port (network order); 0 unless TCP, UDP, UDP-Lite, SCTP or DCCP */
-    __be16 dport;     /**< destination port; ICMP and ICMPv6: type << 8 | code (network order) */
-    __u8 proto;       /**< IP protocol */
-    __u8 tos;         /**< IPv4 TOS or IPv6 traffic class without the ECN bits: the DSCP */
-    __u8 dir;         /**< enum flow_dir */
-    __u8 ipver;       /**< 4 or 6 */
-    __u16 vlan;       /**< outer VLAN ID seen in the packet, 0 = untagged */
-    __u16 vlan_inner; /**< inner VLAN ID (QinQ), 0 = none */
-    __u32 pad;        /**< always 0 */
+    __u32 in_if;       /**< ingressInterface; 0 for packets sent by this host */
+    __u32 out_if;      /**< egressInterface; 0 on ingress (routing not done yet) */
+    __u8 src[16];      /**< source address */
+    __u8 dst[16];      /**< destination address */
+    __be16 sport;      /**< source port (network order); 0 unless TCP, UDP, UDP-Lite, SCTP or DCCP */
+    __be16 dport;      /**< destination port; ICMP and ICMPv6: type << 8 | code (network order) */
+    __u8 proto;        /**< IP protocol */
+    __u8 tos;          /**< IPv4 TOS or IPv6 traffic class without the ECN bits: the DSCP */
+    enum flow_dir dir; /**< direction */
+    __u8 ipver;        /**< 4 or 6 */
+    __u16 vlan;        /**< outer VLAN ID seen in the packet, 0 = untagged */
+    __u16 vlan_inner;  /**< inner VLAN ID (QinQ), 0 = none */
+    __u32 pad;         /**< always 0 */
 };
 
 /** Counters of one flow within one measurement interval. */

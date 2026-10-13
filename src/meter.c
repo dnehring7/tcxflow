@@ -11,7 +11,6 @@
 
 #include <errno.h>
 #include <stdarg.h>
-#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -22,14 +21,14 @@
 #include <bpf/libbpf.h>
 #include <bpf/libbpf_common.h>
 
-#include "bpfobj.h"
 #include "flow.h"
+#include "tcxflow.skel.h"
 
-#define DRAIN_BATCH 4096 ///< flows read per bpf_map_lookup_and_delete_batch() call
+static constexpr __u32 DRAIN_BATCH = 4096; ///< flows read per bpf_map_lookup_and_delete_batch() call
 
 static bool verbose_log;
 
-static int libbpf_log(enum libbpf_print_level level, const char *fmt, va_list ap) {
+[[gnu::format(printf, 2, 0)]] static int libbpf_log(enum libbpf_print_level level, const char *fmt, va_list ap) {
     if (level != LIBBPF_WARN && !verbose_log)
         return 0;
     return vfprintf(stderr, fmt, ap);
@@ -40,27 +39,22 @@ void meter_set_verbose(bool verbose) {
     (void)libbpf_set_print(libbpf_log);
 }
 
-static int map_fd(const struct meter *m, const char *name) {
-    const struct bpf_map *map = bpf_object__find_map_by_name(m->obj, name);
-
-    return map ? bpf_map__fd(map) : -ENOENT;
-}
-
 /*
  * Point active[0] at flows[idx]. The kernel runs synchronize_rcu() before an update of an
  * array of maps returns: no program still writes to the previous map afterwards.
  */
 static int set_active(struct meter *m, uint32_t idx) {
     const __u32 zero = 0;
+    const int err =
+        bpf_map__update_elem(m->skel->maps.active, &zero, sizeof(zero), &m->flows_fd[idx], sizeof(int), BPF_ANY);
 
-    if (bpf_map_update_elem(m->active_fd, &zero, &m->flows_fd[idx], BPF_ANY))
-        return -errno;
+    if (err)
+        return err;
     m->active = idx;
     return 0;
 }
 
 int meter_open(struct meter *m, uint32_t max_flows) {
-    const char *names[2] = {"flows0", "flows1"};
     int err = 0;
 
     memset(m, 0, sizeof(*m));
@@ -71,35 +65,25 @@ int meter_open(struct meter *m, uint32_t max_flows) {
     m->percpu = calloc((size_t)m->ncpus, sizeof(*m->percpu));
     if (!m->percpu)
         return -ENOMEM;
-    m->obj = bpf_object__open_mem(tcxflow_bpf_obj, (size_t)tcxflow_bpf_obj_len, NULL);
-    if (!m->obj) {
+    m->skel = tcxflow_bpf__open();
+    if (!m->skel) {
         err = -errno;
         meter_close(m);
         return err;
     }
-    for (int i = 0; i < 2; i++) {
-        struct bpf_map *map = bpf_object__find_map_by_name(m->obj, names[i]);
-
-        if (!map || bpf_map__set_max_entries(map, max_flows)) {
-            meter_close(m);
-            return -EINVAL;
-        }
-    }
-    err = bpf_object__load(m->obj);
+    err = bpf_map__set_max_entries(m->skel->maps.flows0, max_flows);
+    if (!err)
+        err = bpf_map__set_max_entries(m->skel->maps.flows1, max_flows);
+    if (!err)
+        err = tcxflow_bpf__load(m->skel);
     if (err) {
         meter_close(m);
         return err;
     }
-    m->prog[FLOW_DIR_IN] = bpf_object__find_program_by_name(m->obj, "tcxflow_ingress");
-    m->prog[FLOW_DIR_OUT] = bpf_object__find_program_by_name(m->obj, "tcxflow_egress");
-    m->active_fd = map_fd(m, "active");
-    m->flows_fd[0] = map_fd(m, names[0]);
-    m->flows_fd[1] = map_fd(m, names[1]);
-    m->stats_fd = map_fd(m, "stats");
-    if (!m->prog[0] || !m->prog[1] || m->active_fd < 0 || m->flows_fd[0] < 0 || m->flows_fd[1] < 0 || m->stats_fd < 0) {
-        meter_close(m);
-        return -ENOENT;
-    }
+    m->prog[FLOW_DIR_IN] = m->skel->progs.tcxflow_ingress;
+    m->prog[FLOW_DIR_OUT] = m->skel->progs.tcxflow_egress;
+    m->flows_fd[0] = bpf_map__fd(m->skel->maps.flows0);
+    m->flows_fd[1] = bpf_map__fd(m->skel->maps.flows1);
     err = set_active(m, 0);
     if (err) {
         meter_close(m);
@@ -120,10 +104,9 @@ struct bpf_link *meter_attach(const struct meter *m, int ifindex, enum flow_dir 
 }
 
 unsigned meter_link_ifindex(const struct bpf_link *link) {
-    struct bpf_link_info info;
+    struct bpf_link_info info = {};
     __u32 len = sizeof(info);
 
-    memset(&info, 0, sizeof(info));
     if (bpf_link_get_info_by_fd(bpf_link__fd(link), &info, &len))
         return 0;
     return info.tcx.ifindex;
@@ -140,14 +123,14 @@ int meter_drain(const struct meter *m, int idx, meter_flow_fn fn, void *ctx) {
     static struct flow_key keys[DRAIN_BATCH];
     static struct flow_val vals[DRAIN_BATCH];
     __u32 batch = 0;
-    __u32 *in = NULL;
+    __u32 *in = nullptr;
     int total = 0;
     int err = 0;
 
     do {
         __u32 n = DRAIN_BATCH;
 
-        err = bpf_map_lookup_and_delete_batch(m->flows_fd[idx], in, &batch, keys, vals, &n, NULL);
+        err = bpf_map_lookup_and_delete_batch(m->flows_fd[idx], in, &batch, keys, vals, &n, nullptr);
         // The kernel reports a count only on success and at the end of the map (-ENOENT). After
         // any other error, n still holds the buffer size and the buffers the flows of the
         // previous call: passing them on would count those flows twice.
@@ -163,17 +146,19 @@ int meter_drain(const struct meter *m, int idx, meter_flow_fn fn, void *ctx) {
 
 int meter_stats(const struct meter *m, uint64_t out[STAT_MAX]) {
     const __u32 zero = 0;
-    const int err = bpf_map_lookup_elem(m->stats_fd, &zero, m->percpu);
+    // Sizes checked by libbpf: a per-CPU value has to be read for every possible CPU at once.
+    const int err = bpf_map__lookup_elem(m->skel->maps.stats, &zero, sizeof(zero), m->percpu,
+                                         (size_t)m->ncpus * sizeof(*m->percpu), 0);
 
     memset(out, 0, STAT_MAX * sizeof(*out));
     for (int cpu = 0; !err && cpu < m->ncpus; cpu++)
         for (int i = 0; i < STAT_MAX; i++)
             out[i] += m->percpu[cpu].c[i];
-    return err ? -errno : 0;
+    return err;
 }
 
 void meter_close(struct meter *m) {
-    bpf_object__close(m->obj);
+    tcxflow_bpf__destroy(m->skel);
     free(m->percpu);
     memset(m, 0, sizeof(*m));
 }

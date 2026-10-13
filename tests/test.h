@@ -45,7 +45,7 @@ static int tests_failed;
     } while (0)
 
 /* The string @p haystack contains @p needle. */
-#define CHECK_CONTAINS(haystack, needle) CHECK(strstr((haystack), (needle)) != NULL)
+#define CHECK_CONTAINS(haystack, needle) CHECK(strstr((haystack), (needle)) != nullptr)
 
 #define RUN_TEST(fn)                                                                                                   \
     do {                                                                                                               \

@@ -11,16 +11,16 @@
 #include <stdint.h>
 #include <time.h>
 
-#define TCXFLOW_VERSION "v1.0.0" ///< release version, the same as its git tag; the Makefile reads it from here
+#define TCXFLOW_VERSION "v1.1.0" ///< release version, the same as its git tag; the Makefile reads it from here
 
-#define NSEC_PER_SEC ((uint64_t)1000000000) ///< nanoseconds per second
+constexpr uint64_t NSEC_PER_SEC = 1'000'000'000; ///< nanoseconds per second
 
 /**
  * Log a message to stderr (journald when run by systemd), prefixed with "tcxflow: ".
  *
  * @param fmt  printf() format, followed by its arguments
  */
-void log_msg(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+[[gnu::format(printf, 1, 2)]] void log_msg(const char *fmt, ...);
 
 /**
  * Current time of a clock.
@@ -28,6 +28,6 @@ void log_msg(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
  * @param clk  CLOCK_MONOTONIC, CLOCK_REALTIME, ...
  * @return nanoseconds
  */
-uint64_t clock_ns(clockid_t clk);
+[[nodiscard]] uint64_t clock_ns(clockid_t clk);
 
 #endif // TCXFLOW_UTIL_H

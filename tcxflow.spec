@@ -5,7 +5,7 @@
 # Build directly from tarball: rpmbuild -ta tcxflow-<version>.tar.gz
 
 Name:           tcxflow
-Version:        1.0.0
+Version:        1.1.0
 Release:        1%{?dist}
 Summary:        Lightweight eBPF-based IPFIX flow accounting
 
@@ -14,10 +14,11 @@ URL:            https://github.com/dnehring7/tcxflow
 Source0:        %{url}/archive/refs/tags/v%{version}.tar.gz#/%{name}-%{version}.tar.gz
 ExclusiveArch:  x86_64
 
-BuildRequires:  clang
-BuildRequires:  gcc
+BuildRequires:  bpftool
+BuildRequires:  clang >= 19
+BuildRequires:  gcc >= 14
 BuildRequires:  make
-BuildRequires:  pkgconfig(libbpf) >= 1.3
+BuildRequires:  pkgconfig(libbpf) >= 1.5
 BuildRequires:  systemd-rpm-macros
 
 %description

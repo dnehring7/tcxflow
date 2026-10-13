@@ -18,7 +18,6 @@
 #include <net/if.h>
 #include <sched.h>
 #include <signal.h>
-#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -42,17 +41,20 @@
 #include "util.h"
 #include "vlan.h"
 
-#define FIN_LINGER_NS (2 * NSEC_PER_SEC) ///< closed TCP flows: export after 2 s without packets
-#define CACHE_BUCKETS 65536              ///< initial hash buckets of the flow cache
-#define CACHE_LIMIT_FACTOR 8             ///< the flow cache holds at most this many times max-flows
-#define IFMAP_SIZE 128                   ///< ifindex lookup slots: a power of two, > 2 * CONFIG_MAX_IFACES
-#define DRAIN_RETRIES 10                 ///< failed map switches or drains in a row before tcxflow exits
+static constexpr uint64_t FIN_LINGER_NS = 2 * NSEC_PER_SEC; ///< closed TCP flows: export after 2 s without packets
+static constexpr uint32_t CACHE_BUCKETS = 65536;            ///< initial hash buckets of the flow cache
+static constexpr uint32_t CACHE_LIMIT_FACTOR = 8;           ///< the flow cache holds at most this many times max-flows
+static constexpr unsigned IFMAP_SIZE = 128;                 ///< ifindex lookup slots
+static constexpr int DRAIN_RETRIES = 10; ///< failed map switches or drains in a row before tcxflow exits
+
+// Masking with IFMAP_SIZE - 1 needs a power of two; at most half full keeps the probe chains short.
+static_assert((IFMAP_SIZE & (IFMAP_SIZE - 1)) == 0 && IFMAP_SIZE >= 2 * CONFIG_MAX_IFACES, "IFMAP_SIZE");
 
 /** Runtime state of one configured interface. */
 struct iface_state {
     const struct iface_config *cfg; /**< configuration of the interface */
     unsigned ifindex;               /**< ifindex inside the namespace at start */
-    struct bpf_link *link[2];       /**< tcx links per enum flow_dir, NULL = not metered */
+    struct bpf_link *link[2];       /**< tcx links per enum flow_dir, nullptr = not metered */
     uint16_t vlan;                  /**< outer VLAN ID if it is a VLAN interface, else 0 */
     uint16_t vlan_inner;            /**< inner VLAN ID of a stacked (QinQ) VLAN interface */
     bool gone;                      /**< the interface disappeared */
@@ -63,35 +65,32 @@ struct iface_state {
 /** One slot of the ifindex -> interface table (open addressing). */
 struct ifmap_slot {
     unsigned ifindex;      /**< key */
-    struct iface_state *s; /**< interface, NULL = empty slot */
+    struct iface_state *s; /**< interface, nullptr = empty slot */
 };
 
 /** Everything the exporter needs; one instance per process. */
 struct daemon {
-    const struct config *cfg;                    /**< configuration */
-    struct meter meter;                          /**< BPF side */
-    struct flow_cache cache;                     /**< flows not yet exported */
-    struct ipfix_exporter ipfix;                 /**< IPFIX encoder */
-    struct expire_policy policy;                 /**< timeouts in nanoseconds */
-    struct iface_state ifs[CONFIG_MAX_IFACES];   /**< one per configured interface */
-    struct ifmap_slot ifmap[IFMAP_SIZE];         /**< finds ifs[] by ifindex */
-    int coll_fd[CONFIG_MAX_COLLECTORS];          /**< connected UDP socket per collector */
-    uint64_t coll_sent[CONFIG_MAX_COLLECTORS];   /**< messages sent per collector */
-    uint64_t coll_errors[CONFIG_MAX_COLLECTORS]; /**< failed sends per collector */
-    int ctl_fd;                                  /**< listening control socket */
-    int lock_fd;                                 /**< lock that guards the control socket */
-    int undrained;                               /**< flow map left over from a failed drain, -1 = none */
-    uint64_t drain_errors;                       /**< failed map switches or drains */
-    int64_t mono2real;                           /**< CLOCK_REALTIME - CLOCK_MONOTONIC in nanoseconds */
-    uint64_t now_ns;                             /**< CLOCK_MONOTONIC at the start of the tick */
-    uint32_t now_sec;                            /**< Unix time at the start of the tick */
-    uint64_t started_ns;                         /**< start time, CLOCK_MONOTONIC */
-    uint64_t packets;                            /**< packets accounted, from drained flows */
-    uint64_t bytes;                              /**< bytes accounted, from drained flows */
-    uint64_t lost_seen;                          /**< lost packets (STAT_FULL_PKTS) already logged */
-    uint64_t uncached;                           /**< flow intervals exported at once: cache full */
-    uint64_t tick_ns;                            /**< duration of the last tick */
-    uint64_t tick_max_ns;                        /**< longest tick so far */
+    const struct config *cfg;                     /**< configuration */
+    struct meter meter;                           /**< BPF side */
+    struct flow_cache cache;                      /**< flows not yet exported */
+    struct ipfix_exporter ipfix;                  /**< IPFIX encoder */
+    struct iface_state ifs[CONFIG_MAX_IFACES];    /**< one per configured interface */
+    struct ifmap_slot ifmap[IFMAP_SIZE];          /**< finds ifs[] by ifindex */
+    struct collector coll[CONFIG_MAX_COLLECTORS]; /**< one per configured collector */
+    int ctl_fd;                                   /**< listening control socket */
+    int lock_fd;                                  /**< lock that guards the control socket */
+    int undrained;                                /**< flow map left over from a failed drain, -1 = none */
+    uint64_t drain_errors;                        /**< failed map switches or drains */
+    int64_t mono2real;                            /**< CLOCK_REALTIME - CLOCK_MONOTONIC in nanoseconds */
+    uint64_t now_ns;                              /**< CLOCK_MONOTONIC at the start of the tick */
+    uint32_t now_sec;                             /**< Unix time at the start of the tick */
+    uint64_t started_ns;                          /**< start time, CLOCK_MONOTONIC */
+    uint64_t packets;                             /**< packets accounted, from drained flows */
+    uint64_t bytes;                               /**< bytes accounted, from drained flows */
+    uint64_t lost_seen;                           /**< lost packets (STAT_FULL_PKTS) already logged */
+    uint64_t uncached;                            /**< flow intervals exported at once: cache full */
+    uint64_t tick_ns;                             /**< duration of the last tick */
+    uint64_t tick_max_ns;                         /**< longest tick so far */
     char netns_path[sizeof("/run/netns/") + CONFIG_STRING_MAX]; /**< namespace file, "" = none */
     dev_t netns_dev;                                            /**< device of the namespace entered */
     ino_t netns_ino;                                            /**< inode of the namespace entered */
@@ -101,10 +100,7 @@ struct daemon {
 
 static volatile sig_atomic_t stop_requested;
 
-static void on_signal(int sig) {
-    (void)sig;
-    stop_requested = 1;
-}
+static void on_signal([[maybe_unused]] int sig) { stop_requested = 1; }
 
 /*
  * One clock reading per tick, not per flow: all records of a tick share it, and the BPF side's
@@ -121,23 +117,19 @@ static uint64_t epoch_ms(const struct daemon *d, uint64_t mono_ns) {
     return (uint64_t)((int64_t)mono_ns + d->mono2real) / 1000000ULL;
 }
 
+/* collector_templates_fn */
+static size_t template_message(void *ctx, unsigned index, uint8_t *buf, size_t len) {
+    const struct daemon *d = ctx;
+
+    return ipfix_template_message(&d->ipfix, index, d->now_sec, buf, len);
+}
+
 /* ipfix_send_fn: every message goes to every collector, so collectors are redundant copies. */
 static void send_message(void *ctx, const uint8_t *msg, size_t len) {
     struct daemon *d = ctx;
 
-    for (int i = 0; i < d->cfg->n_collectors; i++) {
-        const int rc = collector_send(d->coll_fd[i], msg, len);
-
-        if (rc < 0)
-            d->coll_errors[i]++;
-        else
-            d->coll_sent[i]++;
-        // A collector that refused a message was down or restarted, and one that missed a message
-        // may have missed the templates: both get them with the next message, not with the next
-        // refresh up to a minute later, during which it could not decode the records.
-        if (rc != 0)
-            ipfix_resend_templates(&d->ipfix);
-    }
+    for (int i = 0; i < d->cfg->n_collectors; i++)
+        (void)collector_export(&d->coll[i], msg, len, template_message, d);
 }
 
 /* Called for every drained flow: a hash lookup instead of a scan over up to 64 interfaces. */
@@ -145,7 +137,7 @@ static struct iface_state *iface_lookup(struct daemon *d, unsigned ifindex) {
     for (unsigned h = ifindex & (IFMAP_SIZE - 1); d->ifmap[h].s; h = (h + 1) & (IFMAP_SIZE - 1))
         if (d->ifmap[h].ifindex == ifindex)
             return d->ifmap[h].s;
-    return NULL;
+    return nullptr;
 }
 
 /*
@@ -279,7 +271,7 @@ static size_t export_max_len(const struct daemon *d) {
     size_t max = 0;
 
     for (int i = 0; i < d->cfg->n_collectors; i++) {
-        const size_t m = collector_max_message(d->coll_fd[i]);
+        const size_t m = collector_max_message(d->coll[i].fd);
 
         if (m && (!max || m < max))
             max = m;
@@ -315,8 +307,11 @@ static void tick(struct daemon *d) {
             d->undrained = idle;
     }
     if (d->undrained >= 0) {
-        const int n = meter_drain(&d->meter, d->undrained, collect_flow, d);
+        int n = 0;
 
+        cache_batch_begin(&d->cache);
+        n = meter_drain(&d->meter, d->undrained, collect_flow, d);
+        cache_batch_end(&d->cache);
         if (n < 0) {
             drain_failed(d, "draining", n);
         } else {
@@ -326,7 +321,9 @@ static void tick(struct daemon *d) {
             d->undrained = -1;
         }
     }
-    (void)cache_expire(&d->cache, d->now_ns, &d->policy, false, export_flow, d);
+    (void)cache_expire(&d->cache, d->now_ns, false);
+    // The templates are repeated also while no flow ends, so collectors keep them.
+    ipfix_refresh(&d->ipfix, d->now_ns, d->now_sec);
     // Flushed every tick, even when not full: a record must not wait for more records.
     ipfix_flush(&d->ipfix, d->now_sec);
     warn_if_lost(d);
@@ -351,7 +348,7 @@ static void reply_stats(const struct daemon *d, int fd) {
     const uint64_t up_ns = clock_ns(CLOCK_MONOTONIC) - d->started_ns;
     uint64_t st[STAT_MAX];
     uint64_t cpu_us = 0;
-    struct rusage ru = {0};
+    struct rusage ru = {};
     char uptime[32];
     int gone = 0;
 
@@ -378,12 +375,14 @@ static void reply_stats(const struct daemon *d, int fd) {
     (void)dprintf(fd, "%-18s %llu packets, %llu bytes (flow table full, max_flows %u)\n", "lost",
                   (unsigned long long)st[STAT_FULL_PKTS], (unsigned long long)st[STAT_FULL_BYTES], d->cfg->max_flows);
     (void)dprintf(fd, "%-18s %u (at most %u)\n", "flows cached", d->cache.count, d->cache.limit);
+    // Allocated, not used: the cache keeps the memory of its largest size, up to its limit.
+    (void)dprintf(fd, "%-18s %zu KiB allocated\n", "cache memory", cache_memory(&d->cache) / 1024);
     (void)dprintf(fd, "%-18s %llu (cache full: exported at once)\n", "flows uncached", (unsigned long long)d->uncached);
     (void)dprintf(fd, "%-18s %llu\n", "flows exported", (unsigned long long)d->ipfix.n_records);
     (void)dprintf(fd, "%-18s %llu\n", "ipfix messages", (unsigned long long)d->ipfix.n_messages);
     for (int i = 0; i < d->cfg->n_collectors; i++)
         (void)dprintf(fd, "%-18s %s: %llu sent, %llu errors\n", "collector", d->cfg->collectors[i],
-                      (unsigned long long)d->coll_sent[i], (unsigned long long)d->coll_errors[i]);
+                      (unsigned long long)d->coll[i].sent, (unsigned long long)d->coll[i].errors);
 }
 
 /* "100", "100.200" (QinQ) or "-". */
@@ -488,21 +487,27 @@ static void detach_interfaces(struct daemon *d) {
     for (int i = 0; i < d->cfg->n_ifaces; i++) {
         for (int dir = 0; dir < 2; dir++) {
             (void)bpf_link__destroy(d->ifs[i].link[dir]);
-            d->ifs[i].link[dir] = NULL;
+            d->ifs[i].link[dir] = nullptr;
         }
     }
 }
 
 /* Everything that precedes the main loop. */
 static int start(struct daemon *d) {
+    const struct expire_policy policy = {
+        .inactive_ns = d->cfg->inactive_timeout * NSEC_PER_SEC,
+        .active_ns = d->cfg->active_timeout * NSEC_PER_SEC,
+        .fin_ns = FIN_LINGER_NS,
+    };
     char err[256];
     int rc = 0;
 
     // Sockets first, in the namespace tcxflow was started in: export and control stay on the
     // management side even when the metered interfaces live in another namespace.
     for (int i = 0; i < d->cfg->n_collectors; i++) {
-        d->coll_fd[i] = collector_open(d->cfg->collectors[i], err, sizeof(err));
-        if (d->coll_fd[i] < 0) {
+        d->coll[i].name = d->cfg->collectors[i];
+        d->coll[i].fd = collector_open(d->cfg->collectors[i], err, sizeof(err));
+        if (d->coll[i].fd < 0) {
             log_msg("%s", err);
             return -1;
         }
@@ -510,7 +515,7 @@ static int start(struct daemon *d) {
     d->ctl_fd = control_listen(d->cfg->socket, &d->lock_fd);
     if (d->ctl_fd < 0) {
         log_msg("control socket %s: %s%s", d->cfg->socket, strerror(errno),
-                errno == EADDRINUSE ? " (tcxflow is already running)" : "");
+                errno == EADDRINUSE ? " (tcxflow is already running, or another program uses it)" : "");
         return -1;
     }
     rc = meter_open(&d->meter, d->cfg->max_flows);
@@ -520,7 +525,8 @@ static int start(struct daemon *d) {
     }
     // Small configurations start small; the bucket array doubles as the cache grows.
     if (cache_init(&d->cache, d->cfg->max_flows < CACHE_BUCKETS ? d->cfg->max_flows : CACHE_BUCKETS,
-                   d->cfg->max_flows * CACHE_LIMIT_FACTOR)) {
+                   d->cfg->cache_flows ? d->cfg->cache_flows : d->cfg->max_flows * CACHE_LIMIT_FACTOR, &policy,
+                   export_flow, d)) {
         log_msg("out of memory");
         return -1;
     }
@@ -533,26 +539,36 @@ static int start(struct daemon *d) {
 static int stop(struct daemon *d) {
     int rc = 0;
 
-    if (d->meter.obj) {
-        uint64_t errors[CONFIG_MAX_COLLECTORS];
+    if (d->meter.skel) {
+        uint64_t errors[CONFIG_MAX_COLLECTORS] = {};
         bool drained = true;
+        uint32_t older = 0;
+        int swapped = 0;
 
         detach_interfaces(d);
-        if (meter_swap(&d->meter) < 0) // returns when no program run is left
+        swapped = meter_swap(&d->meter); // returns when no program run is left
+        if (swapped < 0)
             drained = false;
+        // The map written last holds the newest interval, the other one an undrained, older one if
+        // any: that one first, so the cache gets them in time order. After a switch it is active.
+        older = swapped < 0 ? d->meter.active ^ 1U : d->meter.active;
         set_now(d);
         ipfix_set_max_len(&d->ipfix, export_max_len(d)); // a signal can come before the first tick
-        memcpy(errors, d->coll_errors, sizeof(errors));
-        for (int idx = 0; idx < 2; idx++)
-            if (meter_drain(&d->meter, idx, collect_flow, d) < 0)
+        for (int i = 0; i < d->cfg->n_collectors; i++)
+            errors[i] = d->coll[i].errors;
+        for (uint32_t k = 0; k < 2; k++) {
+            cache_batch_begin(&d->cache);
+            if (meter_drain(&d->meter, (int)(older ^ k), collect_flow, d) < 0)
                 drained = false;
-        (void)cache_expire(&d->cache, d->now_ns, &d->policy, true, export_flow, d);
+            cache_batch_end(&d->cache);
+        }
+        (void)cache_expire(&d->cache, d->now_ns, true);
         ipfix_flush(&d->ipfix, d->now_sec);
         // Nothing retries after this: a message not sent now is lost for good.
         for (int i = 0; i < d->cfg->n_collectors; i++) {
-            if (d->coll_errors[i] != errors[i]) {
+            if (d->coll[i].errors != errors[i]) {
                 log_msg("collector %s: %llu messages of the final export not sent", d->cfg->collectors[i],
-                        (unsigned long long)(d->coll_errors[i] - errors[i]));
+                        (unsigned long long)(d->coll[i].errors - errors[i]));
                 rc = -1;
             }
         }
@@ -569,8 +585,8 @@ static int stop(struct daemon *d) {
     if (d->lock_fd >= 0)
         (void)close(d->lock_fd);
     for (int i = 0; i < d->cfg->n_collectors; i++)
-        if (d->coll_fd[i] >= 0)
-            (void)close(d->coll_fd[i]);
+        if (d->coll[i].fd >= 0)
+            (void)close(d->coll[i].fd);
     cache_destroy(&d->cache);
     return rc;
 }
@@ -587,21 +603,16 @@ int daemon_run(const struct config *cfg) {
     d.lock_fd = -1;
     d.undrained = -1;
     for (int i = 0; i < CONFIG_MAX_COLLECTORS; i++)
-        d.coll_fd[i] = -1;
-    d.policy = (struct expire_policy){
-        .inactive_ns = cfg->inactive_timeout * NSEC_PER_SEC,
-        .active_ns = cfg->active_timeout * NSEC_PER_SEC,
-        .fin_ns = FIN_LINGER_NS,
-    };
-    ipfix_init(&d.ipfix, cfg->observation_domain, send_message, &d);
+        d.coll[i].fd = -1;
+    ipfix_init(&d.ipfix, cfg->observation_domain, cfg->template_refresh * NSEC_PER_SEC, send_message, &d);
     set_now(&d);
     d.started_ns = d.now_ns;
 
     // No SA_RESTART: a signal must interrupt poll() so the loop sees stop_requested at once.
     // SIGHUP stops too (and exports everything): there is no reload, and the unit restarts us.
-    (void)sigaction(SIGINT, &sa, NULL);
-    (void)sigaction(SIGTERM, &sa, NULL);
-    (void)sigaction(SIGHUP, &sa, NULL);
+    (void)sigaction(SIGINT, &sa, nullptr);
+    (void)sigaction(SIGTERM, &sa, nullptr);
+    (void)sigaction(SIGHUP, &sa, nullptr);
     (void)signal(SIGPIPE, SIG_IGN); // a control client that hangs up must not kill the daemon
 
     if (start(&d)) {

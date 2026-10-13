@@ -24,7 +24,7 @@
  * @param lowerlen  size of @p lower
  * @return VLAN ID, or 0 if @p name is not a VLAN interface
  */
-uint16_t vlan_parse(FILE *fp, const char *name, char *lower, size_t lowerlen);
+[[nodiscard]] uint16_t vlan_parse(FILE *fp, const char *name, char *lower, size_t lowerlen);
 
 /**
  * VLAN IDs of an interface in the current network namespace: for eth0.100 outer 100;

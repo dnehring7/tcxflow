@@ -17,7 +17,6 @@
 #include <net/if.h>
 #include <netinet/in.h>
 #include <sched.h>
-#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -35,8 +34,8 @@
 #include "meter.h"
 #include "test.h"
 
-#define MAX_FLOWS 1024 // smallest allowed flow table, makes the overflow test quick
-#define LO_IFINDEX 1   // BPF_PROG_TEST_RUN runs the program on the loopback device
+static constexpr uint32_t MAX_FLOWS = 1024; // smallest allowed flow table, makes the overflow test quick
+static constexpr int LO_IFINDEX = 1;        // BPF_PROG_TEST_RUN runs the program on the loopback device
 
 static struct meter m;
 
@@ -158,15 +157,14 @@ static void run(const struct pkt *p, enum flow_dir dir, uint32_t gso_segs, uint3
     run_gso(p, dir, gso_segs, 0, ingress_ifindex);
 }
 
-#define MAX_SEEN 2048
+static constexpr int MAX_SEEN = 2048;
 static struct {
     struct flow_key key;
     struct flow_val val;
 } seen[MAX_SEEN];
 static int n_seen;
 
-static void collect(void *ctx, const struct flow_key *key, const struct flow_val *val) {
-    (void)ctx;
+static void collect([[maybe_unused]] void *ctx, const struct flow_key *key, const struct flow_val *val) {
     if (n_seen < MAX_SEEN) {
         seen[n_seen].key = *key;
         seen[n_seen].val = *val;
@@ -177,8 +175,8 @@ static void collect(void *ctx, const struct flow_key *key, const struct flow_val
 /* Drain both flow maps; the flows are then in seen[0..n_seen). */
 static void drain(void) {
     n_seen = 0;
-    CHECK(meter_drain(&m, 0, collect, NULL) >= 0);
-    CHECK(meter_drain(&m, 1, collect, NULL) >= 0);
+    CHECK(meter_drain(&m, 0, collect, nullptr) >= 0);
+    CHECK(meter_drain(&m, 1, collect, nullptr) >= 0);
 }
 
 static uint64_t stat(enum flow_stat idx) {
@@ -266,7 +264,7 @@ static void test_ipv4_udp_and_icmp(void) {
     CHECK_EQ(seen[1 - udp_idx].key.sport, 0);
 }
 
-#define IP_MF 0x2000 // more fragments
+static constexpr uint16_t IP_MF = 0x2000; // more fragments
 
 static void test_ipv4_fragment(void) {
     struct pkt p;
@@ -525,7 +523,7 @@ static void set16(struct pkt *p, size_t off, uint16_t v) {
     p->data[off + 1] = (uint8_t)v;
 }
 
-#define IP_TOT_LEN (14 + 2) // offset of iphdr.tot_len in an Ethernet frame
+static constexpr size_t IP_TOT_LEN = 14 + 2; // offset of iphdr.tot_len in an Ethernet frame
 
 /*
  * Lengths that contradict the header or the frame: counted as malformed, never as a flow, and
@@ -576,6 +574,87 @@ static void test_malformed_packets(void) {
     drain();
     CHECK_EQ(n_seen, 0);
     CHECK_EQ(stat(STAT_TRUNC) - trunc, 8);
+}
+
+static constexpr size_t UDP_LEN = 14 + 20 + 4; // offset of udphdr.len behind Ethernet and IPv4
+
+/*
+ * The UDP length: below 8 or beyond the IP payload, the kernel drops the datagram. 0 in IPv6
+ * stands for a jumbogram, a first fragment's covers all fragments, and bytes behind it count.
+ */
+static void test_udp_length(void) {
+    const uint64_t trunc = stat(STAT_TRUNC);
+    struct pkt p;
+    int seen6 = 0;
+
+    for (uint16_t len = 0; len < 8; len++) {
+        eth(&p, 0x0800);
+        ipv4(&p, 17, 0, 0, 8);
+        udp(&p, 1, 2, 0);
+        set16(&p, UDP_LEN, len);
+        run(&p, FLOW_DIR_IN, 0, 0);
+    }
+    eth(&p, 0x0800); // beyond the IP payload
+    ipv4(&p, 17, 0, 0, 8);
+    udp(&p, 1, 2, 0);
+    set16(&p, UDP_LEN, 20);
+    run(&p, FLOW_DIR_IN, 0, 0);
+    drain();
+    CHECK_EQ(n_seen, 0);
+    CHECK_EQ(stat(STAT_TRUNC) - trunc, 9);
+
+    eth(&p, 0x0800); // first fragment: the length covers the whole datagram
+    ipv4(&p, 17, 0, IP_MF, 8 + 32);
+    udp(&p, 5000, 5001, 32);
+    set16(&p, UDP_LEN, 8 + 1000);
+    run(&p, FLOW_DIR_IN, 0, 0);
+    eth(&p, 0x0800); // 4 bytes behind the datagram: the IP length counts
+    ipv4(&p, 17, 0, 0, 8 + 4);
+    udp(&p, 6000, 6001, 4);
+    set16(&p, UDP_LEN, 8);
+    run(&p, FLOW_DIR_IN, 0, 0);
+    eth(&p, 0x86dd); // IPv6 with length 0
+    ipv6(&p, 17, 0, 8);
+    udp(&p, 7000, 7001, 0);
+    set16(&p, 14 + 40 + 4, 0);
+    run(&p, FLOW_DIR_IN, 0, 0);
+    drain();
+    CHECK_EQ(n_seen, 3);
+    CHECK_EQ(stat(STAT_TRUNC) - trunc, 9);
+    for (int i = 0; i < n_seen; i++) {
+        if (ntohs(seen[i].key.sport) == 5000)
+            CHECK_EQ(seen[i].val.bytes, 20 + 8 + 32);
+        if (ntohs(seen[i].key.sport) == 6000)
+            CHECK_EQ(seen[i].val.bytes, 20 + 8 + 4);
+        seen6 += ntohs(seen[i].key.sport) == 7000;
+    }
+    CHECK_EQ(seen6, 1);
+}
+
+/* An IPv6 Authentication Header needs 12 bytes at least (RFC 4302): 8 is malformed. */
+static void test_ipv6_auth_header(void) {
+    const uint64_t trunc = stat(STAT_TRUNC);
+    struct pkt p;
+
+    eth(&p, 0x86dd);
+    ipv6(&p, 51, 0, 8 + 8); // AH with payload length 0: 8 bytes, then what looks like UDP
+    put8(&p, 17);
+    put_zero(&p, 7);
+    udp(&p, 1, 2, 0);
+    run(&p, FLOW_DIR_IN, 0, 0);
+    eth(&p, 0x86dd);
+    ipv6(&p, 51, 0, 12 + 8); // AH with payload length 1: 12 bytes, then UDP
+    put8(&p, 17);
+    put8(&p, 1);
+    put_zero(&p, 10);
+    udp(&p, 3000, 3001, 0);
+    run(&p, FLOW_DIR_IN, 0, 0);
+    drain();
+    CHECK_EQ(stat(STAT_TRUNC) - trunc, 1);
+    CHECK_EQ(n_seen, 1);
+    CHECK_EQ(seen[0].key.proto, 17);
+    CHECK_EQ(ntohs(seen[0].key.sport), 3000);
+    CHECK_EQ(seen[0].val.bytes, 40 + 12 + 8);
 }
 
 /* The longest valid TCP header (data offset 15 words), exactly filling tot_len: a flow. */
@@ -659,8 +738,8 @@ static void test_map_swap(void) {
     idle = meter_swap(&m); // the program now writes into the other map
     run(&p, FLOW_DIR_IN, 0, 0);
     n_seen = 0;
-    CHECK_EQ(meter_drain(&m, idle, collect, NULL), 0);
-    CHECK_EQ(meter_drain(&m, 1 - idle, collect, NULL), 1);
+    CHECK_EQ(meter_drain(&m, idle, collect, nullptr), 0);
+    CHECK_EQ(meter_drain(&m, 1 - idle, collect, nullptr), 1);
     (void)meter_swap(&m);
 }
 
@@ -670,7 +749,7 @@ static void test_drain_error(void) {
 
     bad.flows_fd[0] = -1;
     n_seen = 0;
-    CHECK(meter_drain(&bad, 0, collect, NULL) < 0);
+    CHECK(meter_drain(&bad, 0, collect, nullptr) < 0);
     CHECK_EQ(n_seen, 0);
 }
 
@@ -725,7 +804,7 @@ static void test_attach_before_other_programs(void) {
         {.code = BPF_JMP | BPF_EXIT},
     };
     const int home = open("/proc/self/ns/net", O_RDONLY | O_CLOEXEC);
-    struct bpf_link *link = NULL;
+    struct bpf_link *link = nullptr;
     int prog = -1;
 
     CHECK(home >= 0);
@@ -734,11 +813,11 @@ static void test_attach_before_other_programs(void) {
         return;
     }
     CHECK_EQ(loopback_up(), 0);
-    prog = bpf_prog_load(BPF_PROG_TYPE_SCHED_CLS, "pass", "GPL", pass, 2, NULL);
+    prog = bpf_prog_load(BPF_PROG_TYPE_SCHED_CLS, "pass", "GPL", pass, 2, nullptr);
     CHECK(prog >= 0);
-    CHECK_EQ(bpf_prog_attach_opts(prog, LO_IFINDEX, BPF_TCX_INGRESS, NULL), 0);
+    CHECK_EQ(bpf_prog_attach_opts(prog, LO_IFINDEX, BPF_TCX_INGRESS, nullptr), 0);
     link = meter_attach(&m, LO_IFINDEX, FLOW_DIR_IN);
-    CHECK(link != NULL);
+    CHECK(link != nullptr);
     CHECK_EQ(meter_link_ifindex(link), LO_IFINDEX);
     drain();
     loopback_datagram(4242);
@@ -747,7 +826,7 @@ static void test_attach_before_other_programs(void) {
     CHECK_EQ(seen[0].key.proto, 17);
     CHECK_EQ(ntohs(seen[0].key.dport), 4242);
     (void)bpf_link__destroy(link);
-    (void)bpf_prog_detach_opts(prog, LO_IFINDEX, BPF_TCX_INGRESS, NULL);
+    (void)bpf_prog_detach_opts(prog, LO_IFINDEX, BPF_TCX_INGRESS, nullptr);
     (void)close(prog);
     CHECK_EQ(setns(home, CLONE_NEWNET), 0);
     (void)close(home);
@@ -798,6 +877,8 @@ int main(void) {
     RUN_TEST(test_gso_segments);
     RUN_TEST(test_gso_untrusted);
     RUN_TEST(test_malformed_packets);
+    RUN_TEST(test_udp_length);
+    RUN_TEST(test_ipv6_auth_header);
     RUN_TEST(test_tcp_options_exact);
     RUN_TEST(test_egress_interfaces);
     RUN_TEST(test_zero_payload_padding);

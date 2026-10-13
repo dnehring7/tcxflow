@@ -10,7 +10,6 @@
 #include <arpa/inet.h>
 #include <errno.h> // IWYU pragma: keep (ENOSPC)
 #include <netinet/in.h>
-#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -18,6 +17,9 @@
 #include <string.h>
 #include <sys/poll.h>
 #include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/un.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "cache.h"
@@ -35,7 +37,7 @@
 
 static int parse_config(struct config *cfg, const char *text, char *err, size_t errlen) {
     char *copy = strdup(text);
-    FILE *fp = copy ? fmemopen(copy, strlen(copy), "r") : NULL;
+    FILE *fp = copy ? fmemopen(copy, strlen(copy), "r") : nullptr;
     int rc = -2;
 
     config_init(cfg);
@@ -76,13 +78,13 @@ static struct flow_key make_key(int ipver, uint8_t proto, uint16_t sport, uint16
 }
 
 /* IPFIX messages captured from the encoder */
-#define MAX_MSGS 64
+static constexpr int MAX_MSGS = 64;
+static constexpr uint64_t TPL_REFRESH_NS = 60 * NSEC_PER_SEC; // template-refresh default
 static uint8_t msgs[MAX_MSGS][IPFIX_MSG_MAX];
 static size_t msg_len[MAX_MSGS];
 static int n_msgs;
 
-static void capture(void *ctx, const uint8_t *msg, size_t len) {
-    (void)ctx;
+static void capture([[maybe_unused]] void *ctx, const uint8_t *msg, size_t len) {
     if (n_msgs < MAX_MSGS) {
         memcpy(msgs[n_msgs], msg, len);
         msg_len[n_msgs] = len;
@@ -284,37 +286,113 @@ static int udp_listen(uint16_t *port) {
 }
 
 /* A collector that was down (ICMP port unreachable) and is back must get the next message. */
-static void test_collector_send_after_refused(void) {
+/* collector_templates_fn: one template message, "T", for the tests. */
+static size_t test_templates([[maybe_unused]] void *ctx, unsigned index, uint8_t *buf, size_t len) {
+    if (index > 0 || len < 1)
+        return 0;
+    buf[0] = 'T';
+    return 1;
+}
+
+/* The next datagram on rx, "" if none arrives within a second. */
+static void recv_str(int rx, char *buf, size_t len) {
+    struct pollfd pfd = {.fd = rx, .events = POLLIN};
+    ssize_t n = 0;
+
+    buf[0] = '\0';
+    if (poll(&pfd, 1, 1000) != 1)
+        return;
+    n = recv(rx, buf, len - 1, MSG_DONTWAIT);
+    if (n > 0)
+        buf[n] = '\0';
+}
+
+/* A collector that refused a message was down: it gets the templates, then the message again. */
+static void test_collector_export_after_refused(void) {
+    struct collector c = {.name = "test", .fd = -1};
     uint16_t port = 0;
     char spec[32];
     char err[256];
-    char buf[16] = {0};
+    char buf[16];
     int rx = udp_listen(&port);
-    int fd = -1;
 
     CHECK(rx >= 0);
     if (rx < 0)
         return;
     (void)close(rx); // nothing listens on the port now
     (void)snprintf(spec, sizeof(spec), "127.0.0.1:%u", port);
-    fd = collector_open(spec, err, sizeof(err));
-    CHECK(fd >= 0);
-    if (fd < 0)
+    c.fd = collector_open(spec, err, sizeof(err));
+    CHECK(c.fd >= 0);
+    if (c.fd < 0)
         return;
-    CHECK_EQ(collector_send(fd, "one", 3), 0); // goes out, the kernel answers port unreachable
-    (void)usleep(20000);                       // the ICMP error is now pending on fd
-    rx = udp_listen(&port);                    // the collector is back
+    CHECK_EQ(collector_export(&c, "one", 3, test_templates, nullptr), 0); // the kernel answers port unreachable
+    (void)usleep(20000);                                                  // the error is now pending on fd
+    rx = udp_listen(&port);                                               // the collector is back
     CHECK(rx >= 0);
     if (rx >= 0) {
-        struct pollfd pfd = {.fd = rx, .events = POLLIN};
-
-        CHECK_EQ(collector_send(fd, "two", 3), 1); // sent on the second try: the collector restarted
-        CHECK_EQ(poll(&pfd, 1, 1000), 1);
-        CHECK_EQ(recv(rx, buf, sizeof(buf), MSG_DONTWAIT), 3);
+        CHECK_EQ(collector_export(&c, "two", 3, test_templates, nullptr), 0);
+        CHECK(!c.refused); // sent after the refusal: reachable again
+        recv_str(rx, buf, sizeof(buf));
+        CHECK_STR(buf, "T"); // the templates first
+        recv_str(rx, buf, sizeof(buf));
         CHECK_STR(buf, "two");
+        CHECK_EQ(collector_export(&c, "three", 5, test_templates, nullptr), 0);
+        recv_str(rx, buf, sizeof(buf));
+        CHECK_STR(buf, "three"); // no templates any more
         (void)close(rx);
     }
-    (void)close(fd);
+    CHECK_EQ(c.sent, 3);
+    CHECK_EQ(c.errors, 0);
+    (void)close(c.fd);
+}
+
+/*
+ * A message that could not be sent may have carried the templates: they precede the next one,
+ * to this collector only. Another one that keeps refusing does not change what a healthy one gets.
+ */
+static void test_collector_templates_after_failure(void) {
+    struct collector bad = {.name = "bad", .fd = -1};
+    struct collector good = {.name = "good", .fd = -1};
+    struct collector gone = {.name = "gone", .fd = -1};
+    uint16_t port = 0;
+    uint16_t dead = 0;
+    char spec[32];
+    char err[256];
+    char buf[16];
+    const int rx = udp_listen(&port);
+    int tmp = udp_listen(&dead);
+
+    CHECK(rx >= 0 && tmp >= 0);
+    if (rx < 0 || tmp < 0)
+        return;
+    (void)close(tmp);
+    (void)snprintf(spec, sizeof(spec), "127.0.0.1:%u", port);
+    good.fd = collector_open(spec, err, sizeof(err));
+    (void)snprintf(spec, sizeof(spec), "127.0.0.1:%u", dead);
+    gone.fd = collector_open(spec, err, sizeof(err));
+    CHECK(good.fd >= 0 && gone.fd >= 0);
+    CHECK_EQ(collector_export(&bad, "x", 1, test_templates, nullptr), -1); // fd -1: not sent
+    CHECK_EQ(errno, EBADF);
+    CHECK(bad.templates_due);
+    CHECK_EQ(bad.errors, 1);
+    bad.fd = good.fd; // working again
+    CHECK_EQ(collector_export(&bad, "y", 1, test_templates, nullptr), 0);
+    CHECK(!bad.templates_due);
+    recv_str(rx, buf, sizeof(buf));
+    CHECK_STR(buf, "T");
+    recv_str(rx, buf, sizeof(buf));
+    CHECK_STR(buf, "y");
+    for (int i = 0; i < 5; i++) { // gone refuses every message, good gets just the messages
+        (void)collector_export(&gone, "m", 1, test_templates, nullptr);
+        (void)usleep(5000);
+        CHECK_EQ(collector_export(&good, "m", 1, test_templates, nullptr), 0);
+        recv_str(rx, buf, sizeof(buf));
+        CHECK_STR(buf, "m");
+    }
+    CHECK(gone.refused);
+    (void)close(gone.fd);
+    (void)close(good.fd);
+    (void)close(rx);
 }
 
 /* The path MTU of a connected collector socket is known. */
@@ -338,9 +416,9 @@ static void test_control_lock(void) {
     int lock2 = -1;
     int fd1 = -1;
     int fd2 = -1;
-    FILE *fp = NULL;
+    FILE *fp = nullptr;
 
-    CHECK(mkdtemp(dir) != NULL);
+    CHECK(mkdtemp(dir) != nullptr);
     (void)snprintf(sock, sizeof(sock), "%s/sock", dir);
     (void)snprintf(file, sizeof(file), "%s/file", dir);
     fd1 = control_listen(sock, &lock1);
@@ -353,7 +431,7 @@ static void test_control_lock(void) {
     fd2 = control_listen(sock, &lock2);
     CHECK(fd2 >= 0);
     fp = fopen(file, "we");
-    CHECK(fp != NULL);
+    CHECK(fp != nullptr);
     if (fp)
         (void)fclose(fp);
     CHECK_EQ(control_listen(file, &lock1), -1);
@@ -373,6 +451,75 @@ static void test_control_lock(void) {
 }
 
 /* /proc/net/vlan/config: VLAN ID and lower interface by name; header lines are skipped. */
+/* A Unix socket listening at path, as another program would have it: no lock file. */
+static int unix_listen(const char *path) {
+    struct sockaddr_un sa = {.sun_family = AF_UNIX};
+    const int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+
+    (void)snprintf(sa.sun_path, sizeof(sa.sun_path), "%s", path);
+    if (fd < 0 || bind(fd, (const struct sockaddr *)&sa, sizeof(sa)) || listen(fd, 1)) {
+        if (fd >= 0)
+            (void)close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/*
+ * The socket of another program at the configured path is in use, not stale: tcxflow must not
+ * take it over. And whatever answers there without a reply is no tcxflow.
+ */
+static void test_control_foreign_socket(void) {
+    char dir[] = "/tmp/tcxflow-test.XXXXXX";
+    char sock[64];
+    char lock[72];
+    int lock_fd = -1;
+    int other = -1;
+    int peer = -1;
+    FILE *out = tmpfile();
+
+    CHECK(mkdtemp(dir) != nullptr);
+    CHECK(out != nullptr);
+    (void)snprintf(sock, sizeof(sock), "%s/sock", dir);
+    (void)snprintf(lock, sizeof(lock), "%s.lock", sock);
+    other = unix_listen(sock);
+    CHECK(other >= 0);
+    if (other < 0) {
+        if (out)
+            (void)fclose(out);
+        return;
+    }
+    CHECK_EQ(control_listen(sock, &lock_fd), -1);
+    CHECK_EQ(errno, EADDRINUSE);
+    peer = accept(other, nullptr, nullptr); // the connection tcxflow probed with
+    if (peer >= 0)
+        (void)close(peer);
+    // The other program's socket still works: it accepts the request and closes without a reply.
+    if (fork() == 0) {
+        _exit(control_request(sock, "stats", out) == -1 && errno == ENODATA ? 0 : 1);
+    }
+    peer = accept(other, nullptr, nullptr);
+    CHECK(peer >= 0);
+    if (peer >= 0) {
+        char cmd[16];
+
+        CHECK(read(peer, cmd, sizeof(cmd)) > 0); // reads the request, replies nothing
+        (void)close(peer);
+    }
+    {
+        int status = 0;
+
+        (void)wait(&status);
+        CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0); // empty reply: ENODATA
+    }
+    (void)close(other);
+    if (out)
+        (void)fclose(out);
+    (void)unlink(sock);
+    (void)unlink(lock);
+    CHECK_EQ(rmdir(dir), 0);
+}
+
 static void test_vlan_parse(void) {
     static const char listing[] = "VLAN Dev name\t | VLAN ID\n"
                                   "Name-Type: VLAN_NAME_TYPE_RAW_PLUS_VID_NO_PAD\n"
@@ -387,10 +534,10 @@ static void test_vlan_parse(void) {
 
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         char *copy = strdup(listing);
-        FILE *fp = copy ? fmemopen(copy, strlen(copy), "r") : NULL;
+        FILE *fp = copy ? fmemopen(copy, strlen(copy), "r") : nullptr;
         char lower[16] = "";
 
-        CHECK(fp != NULL);
+        CHECK(fp != nullptr);
         if (fp) {
             CHECK_EQ(vlan_parse(fp, cases[i].name, lower, sizeof(lower)), cases[i].vid);
             CHECK_STR(lower, cases[i].lower);
@@ -416,13 +563,13 @@ static void test_ipfix_message_layout(void) {
                                      .vlan = 100,
                                      .vlan_inner = 200,
                                      .end_reason = IPFIX_END_IDLE};
-    const uint8_t *m = NULL;
-    const uint8_t *d = NULL;
+    const uint8_t *m = nullptr;
+    const uint8_t *d = nullptr;
     size_t tpl = 0;
     size_t data = 0;
 
     n_msgs = 0;
-    ipfix_init(&x, 42, capture, NULL);
+    ipfix_init(&x, 42, TPL_REFRESH_NS, capture, nullptr);
     ipfix_add(&x, &rec, 1000, 1760000005);
     CHECK_EQ(n_msgs, 0); // nothing is sent before the flush
     ipfix_flush(&x, 1760000005);
@@ -485,12 +632,12 @@ static void test_ipfix_vlan_ingress(void) {
     struct ipfix_exporter x;
     struct flow_key key = make_key(4, 17, 1, 2);
     const struct ipfix_record rec = {.key = &key, .packets = 1, .vlan = 300, .vlan_inner = 7};
-    const uint8_t *d = NULL;
+    const uint8_t *d = nullptr;
     size_t data = 0;
 
     key.dir = FLOW_DIR_IN;
     n_msgs = 0;
-    ipfix_init(&x, 1, capture, NULL);
+    ipfix_init(&x, 1, TPL_REFRESH_NS, capture, nullptr);
     ipfix_add(&x, &rec, 0, 0);
     ipfix_flush(&x, 0);
     data = find_set(0, IPFIX_TPL_V4);
@@ -508,11 +655,11 @@ static void test_ipfix_icmp_and_ipv6(void) {
     const struct flow_key icmp = make_key(4, FLOW_PROTO_ICMP, 0, 0x0800); // echo request
     const struct flow_key v6 = make_key(6, FLOW_PROTO_ICMPV6, 0, 0x8100); // ICMPv6 echo request
     struct ipfix_record rec = {.key = &icmp, .packets = 1, .bytes = 84, .tcp_flags = 0x02};
-    const uint8_t *d = NULL;
+    const uint8_t *d = nullptr;
     size_t off = 0;
 
     n_msgs = 0;
-    ipfix_init(&x, 0, capture, NULL);
+    ipfix_init(&x, 0, TPL_REFRESH_NS, capture, nullptr);
     ipfix_add(&x, &rec, 0, 1);
     rec.key = &v6;
     ipfix_add(&x, &rec, 0, 1);
@@ -547,7 +694,7 @@ static void test_ipfix_max_len(void) {
     const struct flow_key key = make_key(4, 17, 1, 2);
     const struct ipfix_record rec = {.key = &key, .packets = 1, .bytes = 100};
 
-    ipfix_init(&x, 1, capture, NULL);
+    ipfix_init(&x, 1, TPL_REFRESH_NS, capture, nullptr);
     n_msgs = 0;
     ipfix_set_max_len(&x, 300);
     for (int i = 0; i < 30; i++)
@@ -558,8 +705,8 @@ static void test_ipfix_max_len(void) {
         CHECK(msg_len[i] <= 300);
     ipfix_set_max_len(&x, 100);
     CHECK_EQ(x.max_len, IPFIX_MSG_MIN);
-    ipfix_set_max_len(&x, 0);
-    CHECK_EQ(x.max_len, IPFIX_MSG_MAX);
+    ipfix_set_max_len(&x, 0); // unknown path MTU: 512-byte packets
+    CHECK_EQ(x.max_len, IPFIX_MSG_UNKNOWN);
     ipfix_set_max_len(&x, 9000);
     CHECK_EQ(x.max_len, IPFIX_MSG_MAX);
 }
@@ -571,7 +718,7 @@ static void test_ipfix_split_and_sequence(void) {
     uint32_t records = 0;
 
     n_msgs = 0;
-    ipfix_init(&x, 0, capture, NULL);
+    ipfix_init(&x, 0, TPL_REFRESH_NS, capture, nullptr);
     for (int i = 0; i < 50; i++)
         ipfix_add(&x, &rec, 0, 1);
     ipfix_flush(&x, 1);
@@ -594,7 +741,7 @@ static void test_ipfix_template_refresh(void) {
     const struct ipfix_record rec = {.key = &key, .packets = 1, .bytes = 100};
 
     n_msgs = 0;
-    ipfix_init(&x, 0, capture, NULL);
+    ipfix_init(&x, 0, TPL_REFRESH_NS, capture, nullptr);
     for (unsigned i = 0; i < IPFIX_TPL_REFRESH_MSGS + 1; i++) { // one record per message
         ipfix_add(&x, &rec, i * NSEC_PER_SEC, 1);
         ipfix_flush(&x, 1);
@@ -609,28 +756,98 @@ static void test_ipfix_template_refresh(void) {
     ipfix_add(&x, &rec, 100 * NSEC_PER_SEC, 1); // more than 60 s after the last templates
     ipfix_flush(&x, 1);
     CHECK(find_set(n_msgs - 1, IPFIX_SET_TEMPLATE) != 0);
+}
 
-    ipfix_add(&x, &rec, 101 * NSEC_PER_SEC, 1);
+/* No flow ends for a while: the templates are repeated on their own, the sequence number stays. */
+static void test_ipfix_refresh_idle(void) {
+    struct ipfix_exporter x;
+    const struct flow_key key = make_key(4, 17, 1, 2);
+    const struct ipfix_record rec = {.key = &key, .packets = 1, .bytes = 100};
+
+    n_msgs = 0;
+    ipfix_init(&x, 7, 30 * NSEC_PER_SEC, capture, nullptr); // template-refresh 30
+    ipfix_add(&x, &rec, 10 * NSEC_PER_SEC, 1);
     ipfix_flush(&x, 1);
-    CHECK(find_set(n_msgs - 1, IPFIX_SET_TEMPLATE) == 0);
-    ipfix_resend_templates(&x); // a collector restarted
-    ipfix_add(&x, &rec, 102 * NSEC_PER_SEC, 1);
-    ipfix_flush(&x, 1);
-    CHECK(find_set(n_msgs - 1, IPFIX_SET_TEMPLATE) != 0);
+    CHECK_EQ(n_msgs, 1);
+    ipfix_refresh(&x, 39 * NSEC_PER_SEC, 2); // not due yet
+    ipfix_flush(&x, 2);
+    CHECK_EQ(n_msgs, 1);
+    ipfix_refresh(&x, 40 * NSEC_PER_SEC, 3);
+    ipfix_flush(&x, 3);
+    CHECK_EQ(n_msgs, 2);
+    CHECK(find_set(1, IPFIX_SET_TEMPLATE) != 0);
+    CHECK_EQ(get16(msgs[1] + 2), IPFIX_HDR_LEN + 4 + (2 * (4 + (20 * 4)))); // templates only
+    CHECK_EQ(get32(msgs[1] + 8), 1);         // the sequence number counts the one data record
+    ipfix_refresh(&x, 41 * NSEC_PER_SEC, 4); // just sent
+    ipfix_flush(&x, 4);
+    CHECK_EQ(n_msgs, 2);
+}
+
+/*
+ * A path MTU too small for the templates and a record: the templates go in messages of their
+ * own, one per template below 188 bytes, and every message fits.
+ */
+static void test_ipfix_small_pmtu(void) {
+    struct ipfix_exporter x;
+    const struct flow_key k4 = make_key(4, 17, 1, 2);
+    const struct flow_key k6 = make_key(6, 17, 1, 2);
+    const struct ipfix_record r4 = {.key = &k4, .packets = 1};
+    const struct ipfix_record r6 = {.key = &k6, .packets = 1};
+    const size_t limits[] = {228, IPFIX_MSG_MIN};
+
+    for (size_t l = 0; l < sizeof(limits) / sizeof(limits[0]); l++) {
+        const int tpl_msgs = limits[l] >= IPFIX_HDR_LEN + 4 + (2 * (4 + (20 * 4))) ? 1 : 2;
+
+        n_msgs = 0;
+        ipfix_init(&x, 1, TPL_REFRESH_NS, capture, nullptr);
+        ipfix_set_max_len(&x, limits[l]);
+        ipfix_add(&x, &r4, 0, 0);
+        ipfix_add(&x, &r6, 0, 0);
+        ipfix_flush(&x, 0);
+        CHECK(n_msgs >= tpl_msgs + 1);
+        for (int i = 0; i < n_msgs && i < MAX_MSGS; i++) {
+            CHECK(msg_len[i] <= limits[l]);
+            CHECK_EQ(get16(msgs[i] + 2), msg_len[i]);
+            CHECK_EQ(find_set(i, IPFIX_SET_TEMPLATE) != 0, i < tpl_msgs); // templates first
+        }
+        CHECK_EQ(get16(msgs[0] + IPFIX_HDR_LEN + 4), IPFIX_TPL_V4);
+        if (tpl_msgs == 2)
+            CHECK_EQ(get16(msgs[1] + IPFIX_HDR_LEN + 4), IPFIX_TPL_V6);
+        CHECK_EQ(get32(msgs[0] + 8), 0); // before any data record
+        CHECK_EQ(x.n_records, 2);
+    }
+}
+
+/* What a collector gets before the next message when it needs the templates. */
+static void test_ipfix_template_message(void) {
+    struct ipfix_exporter x;
+    uint8_t buf[512];
+
+    ipfix_init(&x, 9, TPL_REFRESH_NS, capture, nullptr);
+    CHECK_EQ(ipfix_template_message(&x, 0, 5, buf, sizeof(buf)), IPFIX_HDR_LEN + 4 + (2 * 84));
+    CHECK_EQ(get32(buf + 4), 5);  // export time
+    CHECK_EQ(get32(buf + 12), 9); // observation domain
+    CHECK_EQ(ipfix_template_message(&x, 1, 5, buf, sizeof(buf)), 0);
+    CHECK_EQ(ipfix_template_message(&x, 0, 5, buf, 100), 0); // does not fit the buffer
+    ipfix_set_max_len(&x, IPFIX_MSG_MIN);
+    CHECK_EQ(ipfix_template_message(&x, 0, 5, buf, sizeof(buf)), IPFIX_HDR_LEN + 4 + 84);
+    CHECK_EQ(get16(buf + IPFIX_HDR_LEN + 4), IPFIX_TPL_V4);
+    CHECK_EQ(ipfix_template_message(&x, 1, 5, buf, sizeof(buf)), IPFIX_HDR_LEN + 4 + 84);
+    CHECK_EQ(get16(buf + IPFIX_HDR_LEN + 4), IPFIX_TPL_V6);
+    CHECK_EQ(ipfix_template_message(&x, 2, 5, buf, sizeof(buf)), 0);
 }
 
 /* ------------------------------------------------------------------ */
 /* Flow cache                                                         */
 
-#define MAX_EXPORTED 8
+static constexpr int MAX_EXPORTED = 8;
 static struct {
     struct flow_entry entry;
     uint8_t reason;
 } exported[MAX_EXPORTED];
 static int n_exported;
 
-static void collect(void *ctx, const struct flow_entry *entry, uint8_t reason) {
-    (void)ctx;
+static void collect([[maybe_unused]] void *ctx, const struct flow_entry *entry, uint8_t reason) {
     if (n_exported < MAX_EXPORTED) {
         exported[n_exported].entry = *entry;
         exported[n_exported].reason = reason;
@@ -638,9 +855,7 @@ static void collect(void *ctx, const struct flow_entry *entry, uint8_t reason) {
     n_exported++;
 }
 
-static void count_only(void *ctx, const struct flow_entry *entry, uint8_t reason) {
-    (void)entry;
-    (void)reason;
+static void count_only(void *ctx, [[maybe_unused]] const struct flow_entry *entry, [[maybe_unused]] uint8_t reason) {
     (*(uint32_t *)ctx)++;
 }
 
@@ -658,12 +873,12 @@ static void test_cache_merge(void) {
     const struct flow_val second = {
         .first_ns = 1000, .last_ns = 1500, .packets = 2, .bytes = 80, .tcp_flags = 0x810, .ecn = 2};
 
-    CHECK_EQ(cache_init(&c, 16, UINT32_MAX), 0);
+    CHECK_EQ(cache_init(&c, 16, UINT32_MAX, &policy, collect, nullptr), 0);
     CHECK_EQ(cache_add(&c, &key, &first), 0);
     CHECK_EQ(cache_add(&c, &key, &second), 0);
     CHECK_EQ(c.count, 1);
     n_exported = 0;
-    CHECK_EQ(cache_expire(&c, 2000, &policy, true, collect, NULL), 1);
+    CHECK_EQ(cache_expire(&c, 2000, true), 1);
     CHECK_EQ(exported[0].entry.first_ns, 100);
     CHECK_EQ(exported[0].entry.last_ns, 1500);
     CHECK_EQ(exported[0].entry.packets, 5);
@@ -687,16 +902,16 @@ static void test_cache_expire_reasons(void) {
     const struct flow_val v_fin = {
         .first_ns = now - (5 * NSEC_PER_SEC), .last_ns = now - (3 * NSEC_PER_SEC), .tcp_flags = 0x11};
     const struct flow_val v_fresh = {.first_ns = now - NSEC_PER_SEC, .last_ns = now, .tcp_flags = 0x11};
-    uint8_t reasons[5] = {0};
+    uint8_t reasons[5] = {};
 
-    CHECK_EQ(cache_init(&c, 16, UINT32_MAX), 0);
+    CHECK_EQ(cache_init(&c, 16, UINT32_MAX, &policy, collect, nullptr), 0);
     CHECK_EQ(cache_add(&c, &idle, &v_idle), 0);
     CHECK_EQ(cache_add(&c, &active, &v_active), 0);
     CHECK_EQ(cache_add(&c, &fin, &v_fin), 0);
     CHECK_EQ(cache_add(&c, &fresh, &v_fresh), 0);
 
     n_exported = 0;
-    CHECK_EQ(cache_expire(&c, now, &policy, false, collect, NULL), 3);
+    CHECK_EQ(cache_expire(&c, now, false), 3);
     for (int i = 0; i < n_exported && i < MAX_EXPORTED; i++)
         reasons[ntohs(exported[i].entry.key.sport)] = exported[i].reason;
     CHECK_EQ(reasons[1], IPFIX_END_IDLE);
@@ -706,7 +921,7 @@ static void test_cache_expire_reasons(void) {
     CHECK_EQ(c.count, 1); // the fresh flow stays
 
     n_exported = 0;
-    CHECK_EQ(cache_expire(&c, now, &policy, true, collect, NULL), 1);
+    CHECK_EQ(cache_expire(&c, now, true), 1);
     CHECK_EQ(ntohs(exported[0].entry.key.sport), 4);
     CHECK_EQ(exported[0].reason, IPFIX_END_FORCED);
     cache_destroy(&c);
@@ -719,7 +934,7 @@ static void test_cache_growth_and_reuse(void) {
     uint32_t count = 0;
     uint32_t used = 0;
 
-    CHECK_EQ(cache_init(&c, 16, UINT32_MAX), 0);
+    CHECK_EQ(cache_init(&c, 16, UINT32_MAX, &policy, count_only, &count), 0);
     for (uint32_t i = 0; i < n; i++) {
         struct flow_key key = make_key(4, 17, (uint16_t)(i & 0xffff), (uint16_t)(i >> 16));
 
@@ -728,7 +943,7 @@ static void test_cache_growth_and_reuse(void) {
     CHECK_EQ(c.count, n);
     CHECK(c.n_buckets >= n); // buckets doubled along the way
     used = c.used;
-    CHECK_EQ(cache_expire(&c, 2, &policy, true, count_only, &count), n);
+    CHECK_EQ(cache_expire(&c, 2, true), n);
     CHECK_EQ(count, n);
     CHECK_EQ(c.count, 0);
     for (uint32_t i = 0; i < 1000; i++) { // free entries are reused
@@ -747,7 +962,7 @@ static void test_cache_limit(void) {
     const struct flow_key k2 = make_key(4, 17, 2, 2);
     const struct flow_key k3 = make_key(4, 17, 3, 3);
 
-    CHECK_EQ(cache_init(&c, 16, 2), 0);
+    CHECK_EQ(cache_init(&c, 16, 2, &policy, collect, nullptr), 0);
     CHECK_EQ(cache_add(&c, &k1, &val), 0);
     CHECK_EQ(cache_add(&c, &k2, &val), 0);
     CHECK_EQ(cache_add(&c, &k3, &val), -ENOSPC); // a new flow does not fit
@@ -775,7 +990,7 @@ static uint32_t list_length(const struct flow_cache *c, const struct cache_list 
 }
 
 /* The flow model of the randomized test: what a brute-force cache would hold. */
-#define MODEL_KEYS 512
+static constexpr int MODEL_KEYS = 512;
 static struct {
     uint64_t first_ns;
     uint64_t last_ns;
@@ -785,11 +1000,9 @@ static struct {
 } model[MODEL_KEYS];
 static bool model_exported[MODEL_KEYS];
 
-static void model_collect(void *ctx, const struct flow_entry *entry, uint8_t reason) {
+static void model_collect([[maybe_unused]] void *ctx, const struct flow_entry *entry, [[maybe_unused]] uint8_t reason) {
     const uint16_t k = ntohs(entry->key.sport);
 
-    (void)ctx;
-    (void)reason;
     if (k < MODEL_KEYS) {
         CHECK(model[k].cached);
         CHECK_EQ(entry->packets, model[k].packets);
@@ -801,17 +1014,25 @@ static void model_collect(void *ctx, const struct flow_entry *entry, uint8_t rea
  * O(1) expiry must decide exactly like looking at every flow: random updates, FIN/RST and
  * expiry over 300 ticks, compared with a brute-force model after every tick.
  */
+/* The same rules as the cache: whether model flow k has ended at now. */
+static bool model_ended(int k, uint64_t now) {
+    return model[k].cached &&
+           (now - model[k].last_ns >= policy.inactive_ns || now - model[k].first_ns >= policy.active_ns ||
+            ((model[k].tcp_flags & 0x05U) && now - model[k].last_ns >= policy.fin_ns));
+}
+
 static void test_cache_matches_brute_force(void) {
     struct flow_cache c;
     uint64_t rnd = 0x2545f4914f6cdd1dULL;
 
     memset(model, 0, sizeof(model));
-    CHECK_EQ(cache_init(&c, 16, UINT32_MAX), 0);
+    CHECK_EQ(cache_init(&c, 16, UINT32_MAX, &policy, model_collect, nullptr), 0);
     for (uint64_t tick = 1; tick <= 300; tick++) {
         const uint64_t now = tick * NSEC_PER_SEC;
 
         for (int u = 0; u < 40; u++) { // one interval: every update carries this tick's time
             uint16_t k = 0;
+            bool split = false;
             struct flow_val v = {.first_ns = now, .last_ns = now, .packets = 1, .bytes = 100};
             struct flow_key key;
 
@@ -825,7 +1046,12 @@ static void test_cache_matches_brute_force(void) {
             else if ((rnd >> 30) % 80 == 0)
                 v.tcp_flags = 0x04U;
             key = make_key(4, FLOW_PROTO_TCP, k, 80);
+            split = model_ended(k, now); // the record ended before this packet: a new one starts
+            model_exported[k] = false;
             CHECK_EQ(cache_add(&c, &key, &v), 0);
+            CHECK_EQ(model_exported[k], split);
+            if (split)
+                model[k].cached = false;
             if (!model[k].cached)
                 model[k] = (__typeof__(model[0])){.cached = true, .first_ns = now};
             model[k].last_ns = now;
@@ -833,12 +1059,9 @@ static void test_cache_matches_brute_force(void) {
             model[k].packets++;
         }
         memset(model_exported, 0, sizeof(model_exported));
-        (void)cache_expire(&c, now, &policy, false, model_collect, NULL);
+        (void)cache_expire(&c, now, false);
         for (int k = 0; k < MODEL_KEYS; k++) {
-            const bool ended =
-                model[k].cached &&
-                (now - model[k].last_ns >= policy.inactive_ns || now - model[k].first_ns >= policy.active_ns ||
-                 ((model[k].tcp_flags & 0x05U) && now - model[k].last_ns >= policy.fin_ns));
+            const bool ended = model_ended(k, now);
 
             CHECK_EQ(model_exported[k], ended);
             if (ended)
@@ -866,14 +1089,122 @@ static void test_cache_expiry_delay_bounded(void) {
     const struct expire_policy p = {.inactive_ns = 10 * NSEC_PER_SEC, .active_ns = 500000000, .fin_ns = NSEC_PER_SEC};
     uint32_t count = 0;
 
-    CHECK_EQ(cache_init(&c, 16, 16), 0);
+    CHECK_EQ(cache_init(&c, 16, 16, &p, count_only, &count), 0);
     CHECK_EQ(cache_add(&c, &young, &v_young), 0); // same interval, drained first
     CHECK_EQ(cache_add(&c, &old, &v_old), 0);
-    (void)cache_expire(&c, 1000000000, &p, false, count_only, &count); // old is due, may wait
+    (void)cache_expire(&c, 1000000000, false); // old is due, may wait
     CHECK(count <= 1);
-    (void)cache_expire(&c, 1400000000, &p, false, count_only, &count); // young is due: both gone
+    (void)cache_expire(&c, 1400000000, false); // young is due: both gone
     CHECK_EQ(count, 2);
     CHECK_EQ(c.count, 0);
+    cache_destroy(&c);
+}
+
+/* Packets after a gap longer than the inactive timeout start a new record, expiry run or not. */
+static void test_cache_idle_gap(void) {
+    struct flow_cache c;
+    const struct flow_key k = make_key(4, 17, 1, 2);
+    const struct flow_val a = {.first_ns = 100000000, .last_ns = 100000000, .packets = 1};
+    const struct flow_val b = {.first_ns = 15900000000ULL, .last_ns = 15900000000ULL, .packets = 1};
+    const struct flow_val c2 = {.first_ns = 16100000000ULL, .last_ns = 16100000000ULL, .packets = 1};
+
+    CHECK_EQ(cache_init(&c, 16, 16, &policy, collect, nullptr), 0);
+    n_exported = 0;
+    CHECK_EQ(cache_add(&c, &k, &a), 0);
+    (void)cache_expire(&c, 15 * NSEC_PER_SEC, false); // 14.9 s: not yet
+    CHECK_EQ(n_exported, 0);
+    CHECK_EQ(cache_add(&c, &k, &b), 0); // 15.8 s after the last packet
+    CHECK_EQ(n_exported, 1);
+    CHECK_EQ(exported[0].reason, IPFIX_END_IDLE);
+    CHECK_EQ(exported[0].entry.last_ns, a.last_ns);
+    CHECK_EQ(cache_add(&c, &k, &c2), 0); // 0.2 s later: the same new record
+    (void)cache_expire(&c, 17 * NSEC_PER_SEC, true);
+    CHECK_EQ(n_exported, 2);
+    CHECK_EQ(exported[1].entry.first_ns, b.first_ns);
+    CHECK_EQ(exported[1].entry.packets, 2);
+    cache_destroy(&c);
+}
+
+/* A new connection on the same ports, more than 2 s after FIN: a new record. */
+static void test_cache_port_reuse(void) {
+    struct flow_cache c;
+    const struct flow_key k = make_key(4, FLOW_PROTO_TCP, 1000, 80);
+    const struct flow_val fin = {.first_ns = NSEC_PER_SEC, .last_ns = NSEC_PER_SEC, .packets = 3, .tcp_flags = 0x11};
+    const struct flow_val syn = {.first_ns = 3500000000ULL, .last_ns = 3500000000ULL, .packets = 1, .tcp_flags = 0x02};
+
+    CHECK_EQ(cache_init(&c, 16, 16, &policy, collect, nullptr), 0);
+    n_exported = 0;
+    CHECK_EQ(cache_add(&c, &k, &fin), 0);
+    CHECK_EQ(cache_add(&c, &k, &syn), 0);
+    CHECK_EQ(n_exported, 1);
+    CHECK_EQ(exported[0].reason, IPFIX_END_DETECTED);
+    CHECK_EQ(exported[0].entry.packets, 3);
+    (void)cache_expire(&c, 4 * NSEC_PER_SEC, true);
+    CHECK_EQ(n_exported, 2);
+    CHECK_EQ(exported[1].entry.tcp_flags, 0x02); // the new connection only
+    cache_destroy(&c);
+}
+
+/* stop() drains both maps; the newer interval may come first: the record still starts at the older. */
+static void test_cache_older_interval_later(void) {
+    struct flow_cache c;
+    const struct flow_key k = make_key(4, 17, 1, 2);
+    const struct flow_val newer = {.first_ns = 2 * NSEC_PER_SEC, .last_ns = 3 * NSEC_PER_SEC, .packets = 1, .ecn = 1};
+    const struct flow_val older = {.first_ns = NSEC_PER_SEC, .last_ns = 1500000000ULL, .packets = 2, .ecn = 2};
+
+    CHECK_EQ(cache_init(&c, 16, 16, &policy, collect, nullptr), 0);
+    n_exported = 0;
+    CHECK_EQ(cache_add(&c, &k, &newer), 0);
+    CHECK_EQ(cache_add(&c, &k, &older), 0);
+    (void)cache_expire(&c, 4 * NSEC_PER_SEC, true);
+    CHECK_EQ(n_exported, 1);
+    CHECK_EQ(exported[0].entry.first_ns, older.first_ns);
+    CHECK_EQ(exported[0].entry.last_ns, newer.last_ns);
+    CHECK_EQ(exported[0].entry.ecn, 2); // the first packet's
+    CHECK_EQ(exported[0].entry.packets, 3);
+    cache_destroy(&c);
+}
+
+/*
+ * A map that collected for 10 s (tcxflow stalled) comes in hash order: its batch is sorted, so a
+ * flow that ended does not wait behind a younger one.
+ */
+static void test_cache_delayed_interval(void) {
+    struct flow_cache c;
+    const struct flow_key young = make_key(4, 17, 1, 2);
+    const struct flow_key old = make_key(4, 17, 3, 4);
+    const struct flow_key mid = make_key(4, FLOW_PROTO_TCP, 5, 6);
+    const struct flow_val a = {.first_ns = 9900000000ULL, .last_ns = 9900000000ULL};
+    const struct flow_val b = {.first_ns = 100000000, .last_ns = 100000000};
+    const struct flow_val m = {.first_ns = 5 * NSEC_PER_SEC, .last_ns = 5 * NSEC_PER_SEC, .tcp_flags = 0x01};
+    const struct expire_policy p = {
+        .inactive_ns = 2 * NSEC_PER_SEC, .active_ns = 100 * NSEC_PER_SEC, .fin_ns = NSEC_PER_SEC};
+    uint32_t count = 0;
+
+    CHECK_EQ(cache_init(&c, 16, 16, &p, count_only, &count), 0);
+    cache_batch_begin(&c);
+    CHECK_EQ(cache_add(&c, &young, &a), 0);
+    CHECK_EQ(cache_add(&c, &mid, &m), 0);
+    CHECK_EQ(cache_add(&c, &old, &b), 0);
+    cache_batch_end(&c);
+    (void)cache_expire(&c, 10 * NSEC_PER_SEC, false);
+    CHECK_EQ(count, 2); // old (idle 9.9 s) and mid (FIN, 5 s), not young
+    CHECK_EQ(c.count, 1);
+    CHECK_EQ(list_length(&c, &c.idle, false), 1);
+    CHECK_EQ(list_length(&c, &c.age, true), 1);
+    cache_destroy(&c);
+}
+
+/* The memory the cache holds, used or not. */
+static void test_cache_memory(void) {
+    struct flow_cache c;
+    const struct flow_val val = {.first_ns = 1, .last_ns = 1, .packets = 1};
+    const struct flow_key k = make_key(4, 17, 1, 1);
+
+    CHECK_EQ(cache_init(&c, 16, 100000, &policy, collect, nullptr), 0);
+    CHECK_EQ(cache_memory(&c), 16 * sizeof(uint32_t));
+    CHECK_EQ(cache_add(&c, &k, &val), 0);
+    CHECK(cache_memory(&c) >= (16 * sizeof(uint32_t)) + sizeof(struct flow_entry));
     cache_destroy(&c);
 }
 
@@ -885,15 +1216,20 @@ int main(void) {
     RUN_TEST(test_config_limits);
     RUN_TEST(test_config_validate);
     RUN_TEST(test_collector_split);
-    RUN_TEST(test_collector_send_after_refused);
+    RUN_TEST(test_collector_export_after_refused);
+    RUN_TEST(test_collector_templates_after_failure);
     RUN_TEST(test_collector_max_message);
     RUN_TEST(test_control_lock);
+    RUN_TEST(test_control_foreign_socket);
     RUN_TEST(test_vlan_parse);
     RUN_TEST(test_ipfix_message_layout);
     RUN_TEST(test_ipfix_icmp_and_ipv6);
     RUN_TEST(test_ipfix_vlan_ingress);
     RUN_TEST(test_ipfix_split_and_sequence);
     RUN_TEST(test_ipfix_template_refresh);
+    RUN_TEST(test_ipfix_refresh_idle);
+    RUN_TEST(test_ipfix_small_pmtu);
+    RUN_TEST(test_ipfix_template_message);
     RUN_TEST(test_ipfix_max_len);
     RUN_TEST(test_cache_merge);
     RUN_TEST(test_cache_expire_reasons);
@@ -901,5 +1237,10 @@ int main(void) {
     RUN_TEST(test_cache_limit);
     RUN_TEST(test_cache_matches_brute_force);
     RUN_TEST(test_cache_expiry_delay_bounded);
+    RUN_TEST(test_cache_idle_gap);
+    RUN_TEST(test_cache_port_reuse);
+    RUN_TEST(test_cache_older_interval_later);
+    RUN_TEST(test_cache_delayed_interval);
+    RUN_TEST(test_cache_memory);
     return test_summary();
 }

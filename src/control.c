@@ -23,9 +23,9 @@
 
 #include "util.h"
 
-#define IO_TIMEOUT_SEC 2       ///< send and receive timeout of a control connection
-#define CMD_TIMEOUT_MS 200     ///< the daemon waits this long at most for a command
-#define NSEC_PER_MSEC 1000000U ///< nanoseconds per millisecond
+static constexpr time_t IO_TIMEOUT_SEC = 2;          ///< send and receive timeout of a control connection
+static constexpr uint64_t CMD_TIMEOUT_MS = 200;      ///< the daemon waits this long at most for a command
+static constexpr uint64_t NSEC_PER_MSEC = 1'000'000; ///< nanoseconds per millisecond
 
 static int make_addr(const char *path, struct sockaddr_un *sa) {
     memset(sa, 0, sizeof(*sa));
@@ -48,7 +48,7 @@ static void set_timeouts(int fd) {
 /* Create the parent directory of path (one level) if it does not exist. */
 static int make_parent_dir(const char *path) {
     char dir[sizeof(((struct sockaddr_un *)0)->sun_path)];
-    char *slash = NULL;
+    char *slash = nullptr;
 
     memcpy(dir, path, strlen(path) + 1);
     slash = strrchr(dir, '/');
@@ -66,6 +66,19 @@ static int fail_close(int fd, int err) {
         (void)close(fd);
     errno = err;
     return -1;
+}
+
+/* Whether something answers at a Unix socket: a socket nobody listens on refuses the connection. */
+static bool answers(const struct sockaddr_un *sa) {
+    const int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    bool alive = true; // what cannot be checked is kept
+
+    if (fd < 0)
+        return alive;
+    if (connect(fd, (const struct sockaddr *)sa, sizeof(*sa)) && (errno == ECONNREFUSED || errno == ENOENT))
+        alive = false;
+    (void)close(fd);
+    return alive;
 }
 
 int control_listen(const char *path, int *lock_fd) {
@@ -87,11 +100,15 @@ int control_listen(const char *path, int *lock_fd) {
         return -1;
     if (flock(lock, LOCK_EX | LOCK_NB))
         return fail_close(lock, errno == EWOULDBLOCK ? EADDRINUSE : errno);
-    // With the lock held, a socket left at the path is stale; anything else is not ours to delete.
+    // With the lock held, no other tcxflow uses a socket left at the path. Another program might
+    // (the configuration names its socket): it is deleted only if nobody answers there.
     if (!lstat(path, &st)) {
         if (!S_ISSOCK(st.st_mode))
             return fail_close(lock, EEXIST);
-        (void)unlink(path);
+        if (answers(&sa))
+            return fail_close(lock, EADDRINUSE);
+        if (unlink(path) && errno != ENOENT)
+            return fail_close(lock, errno);
     }
 
     fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
@@ -111,7 +128,7 @@ int control_listen(const char *path, int *lock_fd) {
 }
 
 int control_accept(int listen_fd, char *cmd, size_t cmdlen) {
-    const int fd = accept4(listen_fd, NULL, NULL, SOCK_CLOEXEC);
+    const int fd = accept4(listen_fd, nullptr, nullptr, SOCK_CLOEXEC);
     const uint64_t deadline = clock_ns(CLOCK_MONOTONIC) + (CMD_TIMEOUT_MS * NSEC_PER_MSEC);
     size_t len = 0;
 
@@ -142,6 +159,7 @@ int control_accept(int listen_fd, char *cmd, size_t cmdlen) {
 int control_request(const char *path, const char *cmd, FILE *out) {
     struct sockaddr_un sa;
     char buf[4096];
+    size_t received = 0;
     ssize_t n = 0;
     int fd = -1;
 
@@ -159,10 +177,17 @@ int control_request(const char *path, const char *cmd, FILE *out) {
         return -1;
     }
     (void)shutdown(fd, SHUT_WR);
-    while ((n = read(fd, buf, sizeof(buf))) > 0)
+    while ((n = read(fd, buf, sizeof(buf))) > 0) {
+        received += (size_t)n;
         if (fwrite(buf, 1, (size_t)n, out) != (size_t)n)
             break;
+    }
     (void)close(fd);
+    // tcxflow always answers: no reply at all comes from something else at the path.
+    if (!n && !received) {
+        errno = ENODATA;
+        return -1;
+    }
     // A failed write (full disk, closed pipe) must not look like success to a script.
     return n < 0 || ferror(out) || fflush(out) ? -1 : 0;
 }

@@ -43,7 +43,7 @@ jobs:
   rpm:
     name: rpm (almalinux 10)
     needs: ci
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     container: almalinux:10
     outputs:
       version: ${{ steps.prep.outputs.version }}
@@ -130,7 +130,7 @@ jobs:
   deb:
     name: deb (debian 13)
     needs: ci
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     container: debian:13
 
     steps:
@@ -139,7 +139,7 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             git ca-certificates \
-            build-essential debhelper fakeroot dpkg-dev clang libbpf-dev pkg-config
+            build-essential debhelper fakeroot dpkg-dev clang libbpf-dev bpftool pkg-config
 
       - name: Checkout tag source
         uses: actions/checkout@v7
@@ -182,7 +182,7 @@ jobs:
   publish:
     name: publish
     needs: [rpm, deb]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: write   # softprops/action-gh-release
       pages: write      # actions/deploy-pages
@@ -197,6 +197,13 @@ jobs:
       PAGES_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
 
     steps:
+      # dpkg-dev (dpkg-scanpackages) and gpg come with the runner; apt-utils (apt-ftparchive) is
+      # no longer part of Ubuntu 26.04's base system.
+      - name: Install repository tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends apt-utils
+
       - name: Import GPG key
         id: gpg
         uses: crazy-max/ghaction-import-gpg@v7
@@ -217,8 +224,6 @@ jobs:
         env:
           KEYFP: ${{ steps.gpg.outputs.fingerprint }}
         run: |
-          # apt-utils (apt-ftparchive), dpkg-dev (dpkg-scanpackages) and gpg
-          # are pre-installed on the ubuntu runner.
           REPO_DIR="site/debian"
           mkdir -p "${REPO_DIR}"
           cp _artifacts/deb-debian-"${CODENAME}"/*.deb "${REPO_DIR}/"

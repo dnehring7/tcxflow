@@ -8,7 +8,6 @@
 #include "config.h"
 
 #include <errno.h>
-#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -18,11 +17,11 @@
 #include "collector.h"
 #include "flow.h"
 
-#define LINE_MAX_LEN 512 ///< longest configuration file line, including the newline
+static constexpr size_t LINE_MAX_LEN = 512; ///< longest configuration file line, including the newline
 
 static int set_number(const char *key, const char *value, unsigned long min, unsigned long max, uint32_t *out,
                       char *err, size_t errlen) {
-    char *end = NULL;
+    char *end = nullptr;
     unsigned long num = 0;
 
     errno = 0;
@@ -98,6 +97,7 @@ static int add_collector(struct config *cfg, const char *value, char *err, size_
 
 void config_init(struct config *cfg) {
     memset(cfg, 0, sizeof(*cfg));
+    cfg->template_refresh = 60;
     cfg->inactive_timeout = 15;
     cfg->active_timeout = 1800;
     cfg->max_flows = 131072;
@@ -122,6 +122,10 @@ int config_set(struct config *cfg, const char *key, const char *value, char *err
         return set_number(key, value, 1, 604800, &cfg->active_timeout, err, errlen);
     if (!strcmp(key, "max-flows"))
         return set_number(key, value, 1024, 1UL << 24, &cfg->max_flows, err, errlen);
+    if (!strcmp(key, "cache-flows"))
+        return set_number(key, value, 1024, 1UL << 27, &cfg->cache_flows, err, errlen);
+    if (!strcmp(key, "template-refresh"))
+        return set_number(key, value, 1, 86400, &cfg->template_refresh, err, errlen);
     if (!strcmp(key, "observation-domain"))
         return set_number(key, value, 0, UINT32_MAX, &cfg->observation_domain, err, errlen);
     if (!strcmp(key, "netns")) {
@@ -145,7 +149,7 @@ int config_set(struct config *cfg, const char *key, const char *value, char *err
 /* Cut a line at '#' or at its end and strip the blanks around what is left. */
 static char *clean_line(char *line) {
     char *start = line;
-    char *last = NULL; // one past the last non-blank character
+    char *last = nullptr; // one past the last non-blank character
 
     while (*start == ' ' || *start == '\t')
         start++;
@@ -176,8 +180,8 @@ int config_read(struct config *cfg, FILE *fp, const char *name, char *err, size_
     int lineno = 0;
 
     while (fgets(line, sizeof(line), fp)) {
-        char *key = NULL;
-        char *value = NULL;
+        char *key = nullptr;
+        char *value = nullptr;
 
         lineno++;
         if (!strchr(line, '\n') && !feof(fp)) {

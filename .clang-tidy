@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2026 Dirk Nehring <dnehring@gmx.net>
 #
-# clang-tidy configuration for tcxflow (C17 userspace + BPF program)
+# clang-tidy configuration for tcxflow (C23 userspace + BPF program)
 
 HeaderFilterRegex: '(src|tests)/.*\.h$'
 SystemHeaders: false

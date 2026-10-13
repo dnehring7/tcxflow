@@ -12,7 +12,6 @@
 
 #include <errno.h>
 #include <getopt.h>
-#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -51,7 +50,9 @@ static void usage(FILE *out) {
                   "      --inactive-timeout SEC    export a flow after SEC seconds without packets (15)\n"
                   "      --active-timeout SEC      export long flows every SEC seconds (1800)\n"
                   "      --max-flows N             BPF flow table size per second (131072)\n"
+                  "      --cache-flows N           flows cached until they end, at most (8 * max-flows)\n"
                   "      --observation-domain ID   IPFIX observation domain id (1)\n"
+                  "      --template-refresh SEC    send the IPFIX templates at least every SEC seconds (60)\n"
                   "  -s, --socket PATH             control socket (%s)\n"
                   "\n"
                   "Other options:\n"
@@ -84,8 +85,11 @@ static int cmd_check(const struct config *cfg) {
 /* stats / interfaces: ask the running exporter over the control socket. */
 static int cmd_query(const char *socket_path, const char *cmd) {
     if (control_request(socket_path, cmd, stdout)) {
-        (void)fprintf(stderr, "tcxflow: cannot reach %s: %s%s\n", socket_path, strerror(errno),
-                      errno == ENOENT || errno == ECONNREFUSED ? " (is tcxflow running?)" : "");
+        if (errno == ENODATA)
+            (void)fprintf(stderr, "tcxflow: no reply from %s (not tcxflow's control socket?)\n", socket_path);
+        else
+            (void)fprintf(stderr, "tcxflow: cannot reach %s: %s%s\n", socket_path, strerror(errno),
+                          errno == ENOENT || errno == ECONNREFUSED ? " (is tcxflow running?)" : "");
         return EXIT_ERROR;
     }
     return EXIT_OK;
@@ -100,23 +104,25 @@ static int cmd_query(const char *socket_path, const char *cmd) {
  */
 int main(int argc, char **argv) {
     static const struct option options[] = {
-        {"interface", required_argument, NULL, 0},
-        {"collector", required_argument, NULL, 0},
-        {"netns", required_argument, NULL, 0},
-        {"inactive-timeout", required_argument, NULL, 0},
-        {"active-timeout", required_argument, NULL, 0},
-        {"max-flows", required_argument, NULL, 0},
-        {"observation-domain", required_argument, NULL, 0},
-        {"socket", required_argument, NULL, 0},
-        {"config", required_argument, NULL, 'c'},
-        {"verbose", no_argument, NULL, 'v'},
-        {"version", no_argument, NULL, 'V'},
-        {"help", no_argument, NULL, 'h'},
-        {NULL, 0, NULL, 0},
+        {"interface", required_argument, nullptr, 0},
+        {"collector", required_argument, nullptr, 0},
+        {"netns", required_argument, nullptr, 0},
+        {"inactive-timeout", required_argument, nullptr, 0},
+        {"active-timeout", required_argument, nullptr, 0},
+        {"max-flows", required_argument, nullptr, 0},
+        {"cache-flows", required_argument, nullptr, 0},
+        {"observation-domain", required_argument, nullptr, 0},
+        {"template-refresh", required_argument, nullptr, 0},
+        {"socket", required_argument, nullptr, 0},
+        {"config", required_argument, nullptr, 'c'},
+        {"verbose", no_argument, nullptr, 'v'},
+        {"version", no_argument, nullptr, 'V'},
+        {"help", no_argument, nullptr, 'h'},
+        {nullptr, 0, nullptr, 0},
     };
     static struct config cfg;
     static struct cli_option cli[256];
-    const char *config_path = NULL;
+    const char *config_path = nullptr;
     const char *cmd = "run";
     bool cli_targets = false; // interfaces or collectors on the command line
     bool verbose = false;
@@ -126,7 +132,7 @@ int main(int argc, char **argv) {
     int idx = 0;
 
     while ((opt = getopt_long(argc, argv, "i:s:c:vVh", options, &idx)) != -1) {
-        const char *key = NULL;
+        const char *key = nullptr;
 
         switch (opt) {
             case 0:
@@ -195,7 +201,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "check"))
         return cmd_check(&cfg);
 
-    (void)setvbuf(stderr, NULL, _IOLBF, 0);
+    (void)setvbuf(stderr, nullptr, _IOLBF, 0);
     meter_set_verbose(verbose);
     return daemon_run(&cfg);
 }

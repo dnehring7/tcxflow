@@ -8,22 +8,19 @@
 #ifndef TCXFLOW_METER_H
 #define TCXFLOW_METER_H
 
-#include <stdbool.h>
 #include <stdint.h>
 
 #include "flow.h"
 
 struct bpf_link;
-struct bpf_object;
 struct bpf_program;
+struct tcxflow_bpf;
 
-/** Loaded BPF object and its map descriptors. */
+/** Loaded BPF object, with its programs and flow maps indexed for direct use. */
 struct meter {
-    struct bpf_object *obj;      /**< libbpf object */
+    struct tcxflow_bpf *skel;    /**< programs and maps (bpftool skeleton), nullptr = not loaded */
     struct bpf_program *prog[2]; /**< [FLOW_DIR_IN] ingress and [FLOW_DIR_OUT] egress program */
-    int active_fd;               /**< "active" array of maps: the flow map the BPF side writes */
     int flows_fd[2];             /**< flows0 and flows1 */
-    int stats_fd;                /**< per-CPU statistics */
     uint32_t active;             /**< index the BPF side currently writes to */
     int ncpus;                   /**< possible CPUs (per-CPU map size) */
     struct flow_stats *percpu;   /**< buffer for one read of the per-CPU statistics */
@@ -46,7 +43,7 @@ void meter_set_verbose(bool verbose);
  * @param max_flows  entries of each flow map
  * @return 0 or -errno
  */
-int meter_open(struct meter *m, uint32_t max_flows);
+[[nodiscard]] int meter_open(struct meter *m, uint32_t max_flows);
 
 /**
  * Attach the program for @p dir to an interface of the current network namespace, in front of
@@ -55,9 +52,9 @@ int meter_open(struct meter *m, uint32_t max_flows);
  * @param m        object from meter_open()
  * @param ifindex  interface index
  * @param dir      FLOW_DIR_IN for tcx ingress, FLOW_DIR_OUT for tcx egress
- * @return link to destroy on shutdown, or NULL with errno set
+ * @return link to destroy on shutdown, or nullptr with errno set
  */
-struct bpf_link *meter_attach(const struct meter *m, int ifindex, enum flow_dir dir);
+[[nodiscard]] struct bpf_link *meter_attach(const struct meter *m, int ifindex, enum flow_dir dir);
 
 /**
  * The interface a tcx link from meter_attach() is attached to. The kernel detaches the links of
@@ -66,7 +63,7 @@ struct bpf_link *meter_attach(const struct meter *m, int ifindex, enum flow_dir 
  * @param link  link from meter_attach()
  * @return interface index, or 0 if the link is detached
  */
-unsigned meter_link_ifindex(const struct bpf_link *link);
+[[nodiscard]] unsigned meter_link_ifindex(const struct bpf_link *link);
 
 /**
  * Point the BPF side at the other flow map. Returns after every program run that may
@@ -75,7 +72,7 @@ unsigned meter_link_ifindex(const struct bpf_link *link);
  * @param m  object from meter_open()
  * @return index of the now idle map, to be passed to meter_drain(), or -errno
  */
-int meter_swap(struct meter *m);
+[[nodiscard]] int meter_swap(struct meter *m);
 
 /**
  * Move every flow out of an idle flow map.
@@ -86,7 +83,7 @@ int meter_swap(struct meter *m);
  * @param ctx  passed to @p fn
  * @return number of flows, or -errno
  */
-int meter_drain(const struct meter *m, int idx, meter_flow_fn fn, void *ctx);
+[[nodiscard]] int meter_drain(const struct meter *m, int idx, meter_flow_fn fn, void *ctx);
 
 /**
  * Sum the per-CPU statistics.
@@ -95,10 +92,10 @@ int meter_drain(const struct meter *m, int idx, meter_flow_fn fn, void *ctx);
  * @param out  receives the counters, indexed by enum flow_stat
  * @return 0 or -errno
  */
-int meter_stats(const struct meter *m, uint64_t out[STAT_MAX]);
+[[nodiscard]] int meter_stats(const struct meter *m, uint64_t out[STAT_MAX]);
 
 /**
- * Unload everything. Attached links must be destroyed first.
+ * Unload everything. Attached links must be destroyed first. Works on a zeroed object.
  *
  * @param m  object from meter_open()
  */
