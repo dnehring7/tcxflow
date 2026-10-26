@@ -24,6 +24,7 @@ constexpr size_t IPFIX_MSG_MAX = 1400;          ///< largest message: fits a 150
 constexpr size_t IPFIX_MSG_MIN = 112;           ///< smallest limit: one IPv6 record; templates then go on their own
 constexpr size_t IPFIX_MSG_UNKNOWN = 464;       ///< limit for an unknown path MTU: 512-byte packets, less IPv6 and UDP
 constexpr size_t IPFIX_HDR_LEN = 16;            ///< message header length
+constexpr size_t IPFIX_HDR_SEQ = 8;             ///< offset of the sequence number in the header
 constexpr uint16_t IPFIX_SET_TEMPLATE = 2;      ///< set id of a template set
 constexpr uint16_t IPFIX_TPL_V4 = 256;          ///< template id of IPv4 records
 constexpr uint16_t IPFIX_TPL_V6 = 257;          ///< template id of IPv6 records

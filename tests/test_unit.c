@@ -621,6 +621,95 @@ static void test_collector_batch_full_buffer(void) {
     (void)close(sv[1]);
 }
 
+/* collector_templates_fn: the template messages of the exporter ctx. */
+static size_t ipfix_templates(void *ctx, unsigned index, uint8_t *buf, size_t len) {
+    return ipfix_template_message(ctx, index, 0, buf, len);
+}
+
+/*
+ * Datagrams on rx: the captured messages first .. first + n - 1, unchanged and in order, and in
+ * between template messages with the sequence number of the message after them. Returns those.
+ */
+static int expect_queued(int rx, int first, int n) {
+    struct pollfd pfd = {.fd = rx, .events = POLLIN};
+    uint8_t m[IPFIX_MSG_MAX];
+    ssize_t len = 0;
+    int templates = 0;
+    int next = first;
+
+    while (next < first + n && poll(&pfd, 1, 1000) == 1 && (len = recv(rx, m, sizeof(m), MSG_DONTWAIT)) > 0) {
+        if ((size_t)len == msg_len[next] && memcmp(m, msgs[next], (size_t)len) == 0) {
+            next++;
+            continue;
+        }
+        CHECK_EQ(get16(m + IPFIX_HDR_LEN), IPFIX_SET_TEMPLATE);
+        CHECK_EQ(get32(m + IPFIX_HDR_SEQ), get32(msgs[next] + IPFIX_HDR_SEQ));
+        templates++;
+    }
+    CHECK_EQ(next, first + n);
+    return templates;
+}
+
+/*
+ * Templates sent to recover a collector precede a queued message, encoded before the encoder
+ * counted the later ones: they carry its sequence number. Both template layouts; at the start,
+ * after a short batch and after a refusal; a second collector gets the queue unchanged.
+ */
+static void test_collector_template_seq(void) {
+    const struct flow_key key = make_key(4, 17, 1, 2);
+    const struct ipfix_record rec = {.key = &key, .packets = 1, .bytes = 100};
+    const size_t limits[] = {IPFIX_MSG_MAX, IPFIX_MSG_MIN};
+    const int records[] = {100, 40};
+
+    for (int l = 0; l < 2; l++) {
+        struct collector c[2] = {{.name = "due", .fd = -1, .templates_due = true}, {.name = "fine", .fd = -1}};
+        struct ipfix_exporter x;
+        struct mmsghdr mm[MAX_MSGS];
+        struct iovec iov[MAX_MSGS];
+        uint16_t port[2] = {};
+        int rx[2] = {-1, -1};
+        char spec[32];
+        char err[256];
+        unsigned n = 0;
+
+        ipfix_init(&x, 7, TPL_REFRESH_NS, 0, capture, nullptr);
+        ipfix_set_max_len(&x, limits[l]);
+        n_msgs = 0;
+        for (int i = 0; i < records[l]; i++)
+            ipfix_add(&x, &rec, 0, 1); // export time 1: recovery templates (0) differ from queued ones
+        ipfix_flush(&x, 1);
+        CHECK(n_msgs >= 5 && n_msgs <= MAX_MSGS);
+        n = (unsigned)n_msgs;
+        for (unsigned i = 0; i < n; i++) {
+            iov[i] = (struct iovec){.iov_base = msgs[i], .iov_len = msg_len[i]};
+            mm[i].msg_hdr = (struct msghdr){.msg_iov = &iov[i], .msg_iovlen = 1};
+        }
+        for (int j = 0; j < 2; j++) {
+            rx[j] = udp_listen(&port[j]);
+            (void)snprintf(spec, sizeof(spec), "127.0.0.1:%u", port[j]);
+            c[j].fd = collector_open(spec, err, sizeof(err));
+            CHECK(rx[j] >= 0 && c[j].fd >= 0);
+        }
+        sendmmsg_limit = 2; // due: templates, message 0, then a short batch
+        collector_export_batch(&c[0], mm, n, ipfix_templates, &x);
+        collector_export_batch(&c[1], mm, n, ipfix_templates, &x);
+        CHECK(expect_queued(rx[0], 0, (int)n) >= 2);
+        CHECK_EQ(expect_queued(rx[1], 0, (int)n), 0);
+        (void)close(rx[0]); // the collector restarts
+        collector_export_batch(&c[0], mm, 1, ipfix_templates, &x);
+        (void)usleep(20000); // the refusal is now pending
+        rx[0] = udp_listen(&port[0]);
+        CHECK(rx[0] >= 0);
+        collector_export_batch(&c[0], mm + 1, n - 1, ipfix_templates, &x);
+        CHECK(expect_queued(rx[0], 1, (int)n - 1) >= 1);
+        CHECK_EQ(c[0].errors, 0);
+        for (int j = 0; j < 2; j++) {
+            (void)close(rx[j]);
+            (void)close(c[j].fd);
+        }
+    }
+}
+
 /* The path MTU of a connected collector socket is known, less the IPv4 or IPv6 and UDP headers. */
 static void test_collector_max_message(void) {
     const char *const specs[] = {"127.0.0.1:9", "[::1]:9"};
@@ -1714,6 +1803,7 @@ int main(void) {
     RUN_TEST(test_collector_waits_for_full_buffer);
     RUN_TEST(test_collector_batch);
     RUN_TEST(test_collector_batch_full_buffer);
+    RUN_TEST(test_collector_template_seq);
     RUN_TEST(test_collector_max_message);
     RUN_TEST(test_control_lock);
     RUN_TEST(test_control_foreign_socket);

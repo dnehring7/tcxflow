@@ -28,7 +28,8 @@ struct collector {
 };
 
 /**
- * Writes the index-th message with just the templates into @p buf (ipfix_template_message()).
+ * Writes the index-th message with just the templates into @p buf (ipfix_template_message()). The
+ * collector gives it the sequence number of the message it precedes.
  *
  * @return message length, 0 after the last message
  */

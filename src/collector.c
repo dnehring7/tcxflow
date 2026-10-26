@@ -21,6 +21,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "ipfix.h"
 #include "util.h"
 
 static constexpr int SNDBUF_SIZE = 4 << 20;     ///< socket send buffer, absorbs export bursts
@@ -119,13 +120,18 @@ static ssize_t send_msg(const struct collector *c, const void *msg, size_t len) 
     return n;
 }
 
-static int send_templates(const struct collector *c, collector_templates_fn templates, void *ctx) {
+/* The templates that msg needs: with its sequence number, as the encoder has moved on since it queued msg. */
+static int send_templates(const struct collector *c, collector_templates_fn templates, void *ctx, const void *msg,
+                          size_t len) {
     uint8_t buf[TEMPLATE_MSG_MAX];
     size_t n = 0;
 
-    for (unsigned i = 0; (n = templates(ctx, i, buf, sizeof(buf))) != 0; i++)
+    for (unsigned i = 0; (n = templates(ctx, i, buf, sizeof(buf))) != 0; i++) {
+        if (n >= IPFIX_HDR_LEN && len >= IPFIX_HDR_LEN) // not in the tests' mock messages
+            memcpy(buf + IPFIX_HDR_SEQ, (const uint8_t *)msg + IPFIX_HDR_SEQ, sizeof(uint32_t));
         if (send_msg(c, buf, n) < 0)
             return -1;
+    }
     return 0;
 }
 
@@ -137,7 +143,7 @@ static int export_result(struct collector *c, const void *msg, size_t len, colle
             log_msg("collector %s: port unreachable, the collector is down or restarting", c->name);
         c->refused = true;
         // While it is still down, the templates draw the next refusal, which this send then reports.
-        (void)send_templates(c, templates, ctx);
+        (void)send_templates(c, templates, ctx, msg, len);
         n = send_msg(c, msg, len);
     }
     if (n < 0) {
@@ -162,7 +168,7 @@ static int export_result(struct collector *c, const void *msg, size_t len, colle
 }
 
 int collector_export(struct collector *c, const void *msg, size_t len, collector_templates_fn templates, void *ctx) {
-    if (c->templates_due && !send_templates(c, templates, ctx))
+    if (c->templates_due && !send_templates(c, templates, ctx, msg, len))
         c->templates_due = false;
     return export_result(c, msg, len, templates, ctx, send_msg(c, msg, len));
 }
