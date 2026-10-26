@@ -435,6 +435,13 @@ static void test_collector_waits_for_full_buffer(void) {
     CHECK_EQ(errno, EAGAIN);
     CHECK_EQ(collector_export(&c, "now", 3, test_templates, nullptr), -1); // no deadline: no waiting
     CHECK_EQ(errno, EAGAIN);
+    start = clock_ns(CLOCK_MONOTONIC);
+    c.wait_until_ns = start + (100 * NSEC_PER_MSEC);
+    CHECK_EQ(collector_export(&c, "never", 5, test_templates, nullptr), -1); // no room until the deadline
+    CHECK_EQ(errno, EAGAIN);
+    CHECK(clock_ns(CLOCK_MONOTONIC) - start >= 100 * NSEC_PER_MSEC);
+    CHECK(clock_ns(CLOCK_MONOTONIC) - start < NSEC_PER_SEC);
+    start = clock_ns(CLOCK_MONOTONIC); // before the fork: the child's delay counts from here
     pid = fork();
     if (pid == 0) { // the collector catches up after 50 ms
         struct pollfd pfd = {.fd = sv[1], .events = POLLIN};
@@ -445,13 +452,12 @@ static void test_collector_waits_for_full_buffer(void) {
             (void)recv(sv[1], buf, sizeof(buf), MSG_DONTWAIT);
         _exit(0);
     }
-    start = clock_ns(CLOCK_MONOTONIC);
     c.wait_until_ns = start + (2 * NSEC_PER_SEC);
     CHECK_EQ(collector_export(&c, "later", 5, test_templates, nullptr), 0);
     CHECK(clock_ns(CLOCK_MONOTONIC) - start >= 40 * NSEC_PER_MSEC); // it waited for room
     CHECK(!c.templates_due);                                        // and sent the templates
     CHECK_EQ(c.sent, 1);
-    CHECK_EQ(c.errors, 1);
+    CHECK_EQ(c.errors, 2);
     (void)waitpid(pid, &status, 0);
     (void)close(sv[0]);
     (void)close(sv[1]);
