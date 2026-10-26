@@ -380,9 +380,9 @@ What matters for flow accounting:
   `ip netns attach dataplane <pid>`, and use `netns dataplane`.
 - **Interfaces and namespaces that disappear.** If an interface disappears (also when it is
   replaced by one with the same name and index: the kernel detaches the BPF programs from the
-  old one), or the namespace is deleted or rebuilt, tcxflow exports what it has and exits with
-  status 1, so it never
-  keeps a deleted namespace (and the interfaces in it) alive. systemd restarts it, and it
+  old one), its programs are detached (`bpftool link detach`), or the namespace is deleted or
+  rebuilt, tcxflow exports what it has and exits with status 1, so it never keeps a deleted
+  namespace (and the interfaces in it) alive. systemd restarts it, and it
   attaches again. If another unit creates the namespace, order tcxflow after it with
   `systemctl edit tcxflow` (`After=` and `Requires=`).
 
