@@ -27,8 +27,9 @@
 # PREFIX, SBINDIR, UNITDIR, SYSCONFDIR, DESTDIR, CC, CLANG, BPFTOOL, PKG_CONFIG, CLANG_FORMAT,
 # CLANG_TIDY, SHELLCHECK, NJOBS.
 
-# The release version without the "v" of its tag (vX.Y.Z), as tarballs and packages use it.
-VERSION = $(shell sed -n 's/^\#define TCXFLOW_VERSION "v\([^"]*\)".*/\1/p' src/util.h)
+# The release version without the "v" of its tag (vX.Y.Z), as tarballs and packages use it; that
+# of HEAD, which dist packs, not of an uncommitted edit.
+VERSION = $(shell git show HEAD:src/util.h | sed -n 's/^\#define TCXFLOW_VERSION "v\([^"]*\)".*/\1/p')
 
 PREFIX     ?= /usr/local
 SBINDIR    ?= $(PREFIX)/sbin
