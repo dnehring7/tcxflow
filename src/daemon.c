@@ -267,6 +267,10 @@ static void tick(struct daemon *d) {
         if (n < 0) {
             drain_failed(d, "draining", n);
         } else {
+            // Packets are lost only in a full map, which drains max-flows flows (test_map_full);
+            // one drained in several attempts may have been full too.
+            if ((uint32_t)n >= d->cfg->max_flows || d->drain_errors)
+                warn_if_lost(d);
             if (d->drain_errors)
                 log_msg("flow maps drained again after %llu failures", (unsigned long long)d->drain_errors);
             d->drain_errors = 0;
@@ -275,7 +279,6 @@ static void tick(struct daemon *d) {
     }
     (void)cache_expire(&d->cache, d->now_ns, false);
     ipfix_tick(&d->ipfix, d->now_ns, d->now_sec);
-    warn_if_lost(d);
     check_target(d);
     d->tick_ns = clock_ns(CLOCK_MONOTONIC) - d->now_ns;
     if (d->tick_ns > d->tick_max_ns)

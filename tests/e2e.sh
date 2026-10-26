@@ -373,6 +373,26 @@ else
     cat "$WORK/tcxflow-batch.log"
 fi
 
+# --- more new flows in a second than max-flows: the packets not accounted are reported --------
+sed -e "s|restart.sock|full.sock|" "$WORK/restart.conf" >"$WORK/full.conf"
+echo "max-flows        1024" >>"$WORK/full.conf"
+"${TCX[@]}" --config "$WORK/full.conf" >"$WORK/tcxflow-full.log" 2>&1 &
+DAEMON=$!
+PIDS+=("$DAEMON")
+wait_started $DAEMON "$WORK/tcxflow-full.log"
+# Over one tick boundary at most: one of the two intervals gets more than 1024 flows.
+# shellcheck disable=SC2016 # expanded by the inner bash
+nsx "$DP" bash -c 'for p in {1..3000}; do printf x >/dev/udp/10.77.0.99/$p; done'
+sleep 2
+kill -TERM $DAEMON
+wait $DAEMON || true
+if grep -q 'WARNING: flow table full, [0-9]* packets not accounted' "$WORK/tcxflow-full.log"; then
+    ok "max-flows exceeded: lost packets reported"
+else
+    fail "max-flows exceeded: no warning"
+    cat "$WORK/tcxflow-full.log"
+fi
+
 # --- an interface replaced by one with the same name and index: the kernel detached tcxflow's
 # links from the old one, so nothing is metered any more; tcxflow must notice and exit ------
 nsx "$DP" ip link add trep type veth peer name trep-peer

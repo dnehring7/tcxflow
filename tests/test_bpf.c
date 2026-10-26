@@ -832,6 +832,7 @@ static void test_attach_before_other_programs(void) {
     (void)close(home);
 }
 
+/* A map that loses packets drains exactly max-flows flows: the daemon reads the counters only then. */
 static void test_map_full(void) {
     const uint64_t lost = stat(STAT_FULL_PKTS);
     struct pkt p;
