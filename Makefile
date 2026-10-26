@@ -61,7 +61,7 @@ LDLIBS         = $(shell $(PKG_CONFIG) --libs libbpf 2>/dev/null || echo -lbpf)
 
 # BPF: the bpf target has no system include directories; those of the host, as clang reports
 # them, include Debian's multiarch directory with the asm/ headers (as libbpf-bootstrap does).
-# Instruction set v4 needs Linux 6.6, which tcx needs anyway.
+# Instruction set v4 (clang's default: v1 up to 19, v3 since 20) needs Linux 6.6, which tcx needs anyway.
 BPF_INCLUDES := $(shell $(CLANG) -v -E - </dev/null 2>&1 | \
                   sed -n '/<...> search starts here:/,/End of search list./{ s| \(/.*\)|-idirafter \1|p }')
 BPF_CFLAGS    = -std=gnu23 -O2 -g -Wall -target bpf -mcpu=v4 -Isrc $(LIBBPF_CFLAGS) $(BPF_INCLUDES)
