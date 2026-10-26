@@ -76,7 +76,6 @@ struct daemon {
     uint64_t uncached;                            /**< flow intervals exported at once: cache full */
     uint64_t tick_ns;                             /**< duration of the last tick */
     uint64_t tick_max_ns;                         /**< longest tick so far */
-    uint32_t ticks_unflushed;                     /**< ticks since the last flush of the IPFIX message */
     char netns_path[sizeof("/run/netns/") + CONFIG_STRING_MAX]; /**< namespace file, "" = none */
     dev_t netns_dev;                                            /**< device of the namespace entered */
     ino_t netns_ino;                                            /**< inode of the namespace entered */
@@ -287,13 +286,7 @@ static void tick(struct daemon *d) {
         }
     }
     (void)cache_expire(&d->cache, d->now_ns, false);
-    // The templates are repeated also while no flow ends, so collectors keep them.
-    ipfix_refresh(&d->ipfix, d->now_ns, d->now_sec);
-    // A partly filled message waits for more records: a quiet exporter sends one packet per interval.
-    if (++d->ticks_unflushed >= d->cfg->export_interval) {
-        ipfix_flush(&d->ipfix, d->now_sec);
-        d->ticks_unflushed = 0;
-    }
+    ipfix_tick(&d->ipfix, d->now_ns, d->now_sec);
     warn_if_lost(d);
     check_target(d);
     d->tick_ns = clock_ns(CLOCK_MONOTONIC) - d->now_ns;
@@ -567,7 +560,8 @@ int daemon_run(const struct config *cfg) {
     d.undrained = -1;
     for (int i = 0; i < CONFIG_MAX_COLLECTORS; i++)
         d.coll[i].fd = -1;
-    ipfix_init(&d.ipfix, cfg->observation_domain, cfg->template_refresh * NSEC_PER_SEC, send_message, &d);
+    ipfix_init(&d.ipfix, cfg->observation_domain, cfg->template_refresh * NSEC_PER_SEC,
+               cfg->export_interval * NSEC_PER_SEC, send_message, &d);
     set_now(&d);
     d.started_ns = d.now_ns;
 

@@ -115,7 +115,7 @@ active-timeout   120
 | `cache-flows` | flows cached until they end, at most (1024–134217728) | 8 × `max-flows` |
 | `observation-domain` | IPFIX observation domain id (0–4294967295) | 1 |
 | `template-refresh` | send the IPFIX templates at least this often, in seconds (1–86400) | 60 |
-| `export-interval` | send a partly filled IPFIX message after this many seconds (1–60) | 10 |
+| `export-interval` | send a partly filled IPFIX message after this many seconds (0–60; 0: every second) | 10 |
 | `socket` | control socket for `stats` and `interfaces`, an absolute path | `/run/tcxflow/tcxflow.sock` |
 
 `option value` and `option = value` are both accepted, and `#` starts a comment.

@@ -182,7 +182,7 @@ static void test_config_errors(void) {
         {"active-timeout -5\n", "must be a number"},
         {"max-flows 100\n", "max-flows must be a number from 1024"},
         {"observation-domain 4294967296\n", "must be a number"},
-        {"export-interval 61\n", "export-interval must be a number from 1 to 60"},
+        {"export-interval 61\n", "export-interval must be a number from 0 to 60"},
         {"netns relative/path\n", "netns must be a name or an absolute path"},
         {"socket run/x.sock\n", "socket must be an absolute path"},
     };
@@ -697,7 +697,7 @@ static void test_ipfix_message_layout(void) {
     size_t data = 0;
 
     n_msgs = 0;
-    ipfix_init(&x, 42, TPL_REFRESH_NS, capture, nullptr);
+    ipfix_init(&x, 42, TPL_REFRESH_NS, 0, capture, nullptr);
     ipfix_add(&x, &rec, 1000, 1760000005);
     CHECK_EQ(n_msgs, 0); // nothing is sent before the flush
     ipfix_flush(&x, 1760000005);
@@ -765,7 +765,7 @@ static void test_ipfix_vlan_ingress(void) {
 
     key.dir = FLOW_DIR_IN;
     n_msgs = 0;
-    ipfix_init(&x, 1, TPL_REFRESH_NS, capture, nullptr);
+    ipfix_init(&x, 1, TPL_REFRESH_NS, 0, capture, nullptr);
     ipfix_add(&x, &rec, 0, 0);
     ipfix_flush(&x, 0);
     data = find_set(0, IPFIX_TPL_V4);
@@ -787,7 +787,7 @@ static void test_ipfix_icmp_and_ipv6(void) {
     size_t off = 0;
 
     n_msgs = 0;
-    ipfix_init(&x, 0, TPL_REFRESH_NS, capture, nullptr);
+    ipfix_init(&x, 0, TPL_REFRESH_NS, 0, capture, nullptr);
     ipfix_add(&x, &rec, 0, 1);
     rec.key = &v6;
     ipfix_add(&x, &rec, 0, 1);
@@ -822,7 +822,7 @@ static void test_ipfix_max_len(void) {
     const struct flow_key key = make_key(4, 17, 1, 2);
     const struct ipfix_record rec = {.key = &key, .packets = 1, .bytes = 100};
 
-    ipfix_init(&x, 1, TPL_REFRESH_NS, capture, nullptr);
+    ipfix_init(&x, 1, TPL_REFRESH_NS, 0, capture, nullptr);
     n_msgs = 0;
     ipfix_set_max_len(&x, 300);
     for (int i = 0; i < 30; i++)
@@ -846,7 +846,7 @@ static void test_ipfix_split_and_sequence(void) {
     uint32_t records = 0;
 
     n_msgs = 0;
-    ipfix_init(&x, 0, TPL_REFRESH_NS, capture, nullptr);
+    ipfix_init(&x, 0, TPL_REFRESH_NS, 0, capture, nullptr);
     for (int i = 0; i < 50; i++)
         ipfix_add(&x, &rec, 0, 1);
     ipfix_flush(&x, 1);
@@ -869,7 +869,7 @@ static void test_ipfix_template_refresh(void) {
     const struct ipfix_record rec = {.key = &key, .packets = 1, .bytes = 100};
 
     n_msgs = 0;
-    ipfix_init(&x, 0, TPL_REFRESH_NS, capture, nullptr);
+    ipfix_init(&x, 0, TPL_REFRESH_NS, 0, capture, nullptr);
     for (unsigned i = 0; i < IPFIX_TPL_REFRESH_MSGS + 1; i++) { // one record per message
         ipfix_add(&x, &rec, i * NSEC_PER_SEC, 1);
         ipfix_flush(&x, 1);
@@ -893,22 +893,42 @@ static void test_ipfix_refresh_idle(void) {
     const struct ipfix_record rec = {.key = &key, .packets = 1, .bytes = 100};
 
     n_msgs = 0;
-    ipfix_init(&x, 7, 30 * NSEC_PER_SEC, capture, nullptr); // template-refresh 30
+    ipfix_init(&x, 7, 30 * NSEC_PER_SEC, 0, capture, nullptr); // template-refresh 30
     ipfix_add(&x, &rec, 10 * NSEC_PER_SEC, 1);
     ipfix_flush(&x, 1);
     CHECK_EQ(n_msgs, 1);
-    ipfix_refresh(&x, 39 * NSEC_PER_SEC, 2); // not due yet
+    ipfix_tick(&x, 39 * NSEC_PER_SEC, 2); // not due yet
     ipfix_flush(&x, 2);
     CHECK_EQ(n_msgs, 1);
-    ipfix_refresh(&x, 40 * NSEC_PER_SEC, 3);
+    ipfix_tick(&x, 40 * NSEC_PER_SEC, 3);
     ipfix_flush(&x, 3);
     CHECK_EQ(n_msgs, 2);
     CHECK(find_set(1, IPFIX_SET_TEMPLATE) != 0);
     CHECK_EQ(get16(msgs[1] + 2), IPFIX_HDR_LEN + 4 + (2 * (4 + (20 * 4)))); // templates only
-    CHECK_EQ(get32(msgs[1] + 8), 1);         // the sequence number counts the one data record
-    ipfix_refresh(&x, 41 * NSEC_PER_SEC, 4); // just sent
+    CHECK_EQ(get32(msgs[1] + 8), 1);      // the sequence number counts the one data record
+    ipfix_tick(&x, 41 * NSEC_PER_SEC, 4); // just sent
     ipfix_flush(&x, 4);
     CHECK_EQ(n_msgs, 2);
+}
+
+/* A partly filled message is sent once it is export-interval old, also when ticks were skipped. */
+static void test_ipfix_tick_wait(void) {
+    struct ipfix_exporter x;
+    const struct flow_key key = make_key(4, 17, 1, 2);
+    const struct ipfix_record rec = {.key = &key, .packets = 1};
+
+    n_msgs = 0;
+    ipfix_init(&x, 1, 86400 * NSEC_PER_SEC, 10 * NSEC_PER_SEC, capture, nullptr);
+    ipfix_add(&x, &rec, 1'200'000'000, 1); // in a tick that ran 200 ms late
+    for (uint64_t t = 1; t <= 10; t++)
+        ipfix_tick(&x, t * NSEC_PER_SEC, (uint32_t)t);
+    CHECK_EQ(n_msgs, 0);
+    ipfix_tick(&x, 11 * NSEC_PER_SEC, 11); // the 10th tick after it
+    CHECK_EQ(n_msgs, 1);
+    ipfix_add(&x, &rec, 12 * NSEC_PER_SEC, 12);
+    ipfix_tick(&x, 100 * NSEC_PER_SEC, 100); // ticks 13 to 99 skipped: the next one sends it
+    CHECK_EQ(n_msgs, 2);
+    CHECK_EQ(x.n_records, 2);
 }
 
 /*
@@ -927,7 +947,7 @@ static void test_ipfix_small_pmtu(void) {
         const int tpl_msgs = limits[l] >= IPFIX_HDR_LEN + 4 + (2 * (4 + (20 * 4))) ? 1 : 2;
 
         n_msgs = 0;
-        ipfix_init(&x, 1, TPL_REFRESH_NS, capture, nullptr);
+        ipfix_init(&x, 1, TPL_REFRESH_NS, 0, capture, nullptr);
         ipfix_set_max_len(&x, limits[l]);
         ipfix_add(&x, &r4, 0, 0);
         ipfix_add(&x, &r6, 0, 0);
@@ -951,7 +971,7 @@ static void test_ipfix_template_message(void) {
     struct ipfix_exporter x;
     uint8_t buf[512];
 
-    ipfix_init(&x, 9, TPL_REFRESH_NS, capture, nullptr);
+    ipfix_init(&x, 9, TPL_REFRESH_NS, 0, capture, nullptr);
     CHECK_EQ(ipfix_template_message(&x, 0, 5, buf, sizeof(buf)), IPFIX_HDR_LEN + 4 + (2 * 84));
     CHECK_EQ(get32(buf + 4), 5);  // export time
     CHECK_EQ(get32(buf + 12), 9); // observation domain
@@ -1428,6 +1448,7 @@ int main(void) {
     RUN_TEST(test_ipfix_split_and_sequence);
     RUN_TEST(test_ipfix_template_refresh);
     RUN_TEST(test_ipfix_refresh_idle);
+    RUN_TEST(test_ipfix_tick_wait);
     RUN_TEST(test_ipfix_small_pmtu);
     RUN_TEST(test_ipfix_template_message);
     RUN_TEST(test_ipfix_max_len);

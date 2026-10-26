@@ -143,7 +143,7 @@ int config_set(struct config *cfg, const char *key, const char *value, char *err
     if (!strcmp(key, "template-refresh"))
         return set_number(key, value, 1, 86400, &cfg->template_refresh, err, errlen);
     if (!strcmp(key, "export-interval"))
-        return set_number(key, value, 1, 60, &cfg->export_interval, err, errlen);
+        return set_number(key, value, 0, 60, &cfg->export_interval, err, errlen);
     if (!strcmp(key, "observation-domain"))
         return set_number(key, value, 0, UINT32_MAX, &cfg->observation_domain, err, errlen);
     if (!strcmp(key, "netns")) {

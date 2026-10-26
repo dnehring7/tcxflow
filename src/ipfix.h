@@ -70,6 +70,8 @@ struct ipfix_exporter {
     unsigned msgs_since_tpl;    /**< messages sent since the last template set */
     uint64_t tpl_refresh_ns;    /**< templates again after this long */
     uint64_t tpl_sent_ns;       /**< CLOCK_MONOTONIC time of the last template set */
+    uint64_t wait_ns;           /**< a partly filled message is sent after this long */
+    uint64_t started_ns;        /**< CLOCK_MONOTONIC time the open message started */
     ipfix_send_fn send;         /**< receives finished messages */
     void *ctx;                  /**< passed to send */
     uint64_t n_messages;        /**< messages sent in total */
@@ -83,10 +85,12 @@ struct ipfix_exporter {
  * @param x           exporter
  * @param domain      observation domain id written into every message header
  * @param refresh_ns  send the templates again after this long (template-refresh)
+ * @param wait_ns     ipfix_tick() sends a partly filled message after this long (export-interval)
  * @param send        receives every finished message
  * @param ctx         passed to @p send
  */
-void ipfix_init(struct ipfix_exporter *x, uint32_t domain, uint64_t refresh_ns, ipfix_send_fn send, void *ctx);
+void ipfix_init(struct ipfix_exporter *x, uint32_t domain, uint64_t refresh_ns, uint64_t wait_ns, ipfix_send_fn send,
+                void *ctx);
 
 /**
  * Limit messages to @p max_len bytes, clamped to IPFIX_MSG_MIN..IPFIX_MSG_MAX; 0 (path MTU
@@ -112,14 +116,14 @@ void ipfix_set_max_len(struct ipfix_exporter *x, size_t max_len);
                                             uint8_t *buf, size_t len);
 
 /**
- * Start a message with the templates if a refresh is due and no message is open: the templates
- * are repeated even while no flow ends. ipfix_flush() sends it.
+ * Call once per second: send the open message once it is about wait_ns old, and start one with the
+ * templates if a refresh is due and no message is open, so they are repeated while no flow ends.
  *
  * @param x        exporter
  * @param now_ns   CLOCK_MONOTONIC time
  * @param now_sec  Unix time for the message header
  */
-void ipfix_refresh(struct ipfix_exporter *x, uint64_t now_ns, uint32_t now_sec);
+void ipfix_tick(struct ipfix_exporter *x, uint64_t now_ns, uint32_t now_sec);
 
 /**
  * Add one record, sending the current message first if the record does not fit.

@@ -129,7 +129,7 @@ collector        127.0.0.1:$PORT1
 collector        127.0.0.1:$PORT2
 inactive-timeout 2
 active-timeout   2
-export-interval  1
+export-interval  0
 socket           $WORK/tcxflow.sock
 EOF
 mkdir "$WORK/c1" "$WORK/c2"
@@ -309,7 +309,7 @@ netns            $DP
 interface        tcol:out
 collector        127.0.0.1:$PORT3
 inactive-timeout 1
-export-interval  1
+export-interval  0
 socket           $WORK/restart.sock
 EOF
 datagram() { nsx "$DP" bash -c "printf x >/dev/udp/10.77.0.99/$1"; } # 29 bytes

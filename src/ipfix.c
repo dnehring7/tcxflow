@@ -14,6 +14,7 @@
 #include <string.h>
 
 #include "flow.h"
+#include "util.h"
 
 /** Information element: IANA id and encoded length. */
 struct ipfix_ie {
@@ -125,6 +126,7 @@ size_t ipfix_template_message(const struct ipfix_exporter *x, unsigned index, ui
  * a small path MTU they leave no room for a record: then they go in messages of their own first.
  */
 static void start_message(struct ipfix_exporter *x, uint64_t now_ns, uint32_t now_sec) {
+    x->started_ns = now_ns;
     x->len = IPFIX_HDR_LEN;
     x->set_id = 0;
     x->records = 0;
@@ -154,10 +156,12 @@ static void close_set(struct ipfix_exporter *x) {
     x->set_id = 0;
 }
 
-void ipfix_init(struct ipfix_exporter *x, uint32_t domain, uint64_t refresh_ns, ipfix_send_fn send, void *ctx) {
+void ipfix_init(struct ipfix_exporter *x, uint32_t domain, uint64_t refresh_ns, uint64_t wait_ns, ipfix_send_fn send,
+                void *ctx) {
     memset(x, 0, sizeof(*x));
     x->domain = domain;
     x->tpl_refresh_ns = refresh_ns;
+    x->wait_ns = wait_ns;
     x->max_len = IPFIX_MSG_MAX;
     x->send = send;
     x->ctx = ctx;
@@ -172,7 +176,10 @@ void ipfix_set_max_len(struct ipfix_exporter *x, size_t max_len) {
     x->max_len = max_len < IPFIX_MSG_MIN ? IPFIX_MSG_MIN : max_len;
 }
 
-void ipfix_refresh(struct ipfix_exporter *x, uint64_t now_ns, uint32_t now_sec) {
+void ipfix_tick(struct ipfix_exporter *x, uint64_t now_ns, uint32_t now_sec) {
+    // By age, so skipped ticks count; half a tick early, so jitter on the tick grid costs no tick.
+    if (x->len && now_ns - x->started_ns + (NSEC_PER_SEC / 2) > x->wait_ns)
+        ipfix_flush(x, now_sec);
     if (!x->len && templates_due(x, now_ns))
         start_message(x, now_ns, now_sec);
 }
