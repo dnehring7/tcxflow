@@ -257,7 +257,7 @@ Two IPFIX templates are used, 256 for IPv4 and 257 for IPv6. Each record contain
 - `flowStartMilliseconds`, `flowEndMilliseconds`, `flowEndReason`
 
 Templates are repeated every 60 seconds (`template-refresh`) and every 20 messages, also while
-no flow ends. A collector that refused a message (it was down or restarted) gets them before
+no flow ends; they never wait for `export-interval`. A collector that refused a message (it was down or restarted) gets them before
 that message is sent again, and one that missed a message before the next; the other
 collectors are not affected. tcxflow logs when a collector refuses or messages cannot be sent,
 and when it is reachable again. Messages are sized to fit the path MTU towards every collector

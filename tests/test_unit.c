@@ -886,29 +886,42 @@ static void test_ipfix_template_refresh(void) {
     CHECK(find_set(n_msgs - 1, IPFIX_SET_TEMPLATE) != 0);
 }
 
-/* No flow ends for a while: the templates are repeated on their own, the sequence number stays. */
+/*
+ * The templates keep their own deadline, shorter than export-interval here: on their own while no
+ * flow ends, after the data waiting, and with the data they started a message with.
+ */
 static void test_ipfix_refresh_idle(void) {
     struct ipfix_exporter x;
     const struct flow_key key = make_key(4, 17, 1, 2);
     const struct ipfix_record rec = {.key = &key, .packets = 1, .bytes = 100};
 
     n_msgs = 0;
-    ipfix_init(&x, 7, 30 * NSEC_PER_SEC, 0, capture, nullptr); // template-refresh 30
+    ipfix_init(&x, 7, 30 * NSEC_PER_SEC, 60 * NSEC_PER_SEC, capture, nullptr); // template-refresh 30
     ipfix_add(&x, &rec, 10 * NSEC_PER_SEC, 1);
     ipfix_flush(&x, 1);
     CHECK_EQ(n_msgs, 1);
     ipfix_tick(&x, 39 * NSEC_PER_SEC, 2); // not due yet
-    ipfix_flush(&x, 2);
     CHECK_EQ(n_msgs, 1);
     ipfix_tick(&x, 40 * NSEC_PER_SEC, 3);
-    ipfix_flush(&x, 3);
     CHECK_EQ(n_msgs, 2);
-    CHECK(find_set(1, IPFIX_SET_TEMPLATE) != 0);
     CHECK_EQ(get16(msgs[1] + 2), IPFIX_HDR_LEN + 4 + (2 * (4 + (20 * 4)))); // templates only
     CHECK_EQ(get32(msgs[1] + 8), 1);      // the sequence number counts the one data record
     ipfix_tick(&x, 41 * NSEC_PER_SEC, 4); // just sent
-    ipfix_flush(&x, 4);
     CHECK_EQ(n_msgs, 2);
+    ipfix_add(&x, &rec, 50 * NSEC_PER_SEC, 5);
+    ipfix_tick(&x, 60 * NSEC_PER_SEC, 6); // the data waits for export-interval ...
+    CHECK_EQ(n_msgs, 2);
+    ipfix_tick(&x, 70 * NSEC_PER_SEC, 7); // ... the templates do not: the data goes first
+    CHECK_EQ(n_msgs, 4);
+    CHECK(find_set(2, IPFIX_TPL_V4) != 0 && find_set(2, IPFIX_SET_TEMPLATE) == 0);
+    CHECK(find_set(3, IPFIX_SET_TEMPLATE) != 0 && find_set(3, IPFIX_TPL_V4) == 0);
+    CHECK_EQ(get32(msgs[3] + 8), 2);
+    ipfix_add(&x, &rec, 101 * NSEC_PER_SEC, 8); // due again: one message with templates and data
+    ipfix_tick(&x, 101 * NSEC_PER_SEC, 8);
+    CHECK_EQ(n_msgs, 5);
+    CHECK(find_set(4, IPFIX_SET_TEMPLATE) != 0 && find_set(4, IPFIX_TPL_V4) != 0);
+    CHECK_EQ(get32(msgs[4] + 8), 2);
+    CHECK_EQ(x.n_records, 3);
 }
 
 /* A partly filled message is sent once it is export-interval old, also when ticks were skipped. */
@@ -919,15 +932,17 @@ static void test_ipfix_tick_wait(void) {
 
     n_msgs = 0;
     ipfix_init(&x, 1, 86400 * NSEC_PER_SEC, 10 * NSEC_PER_SEC, capture, nullptr);
+    ipfix_tick(&x, 0, 0); // the initial templates
+    CHECK_EQ(n_msgs, 1);
     ipfix_add(&x, &rec, 1'200'000'000, 1); // in a tick that ran 200 ms late
     for (uint64_t t = 1; t <= 10; t++)
         ipfix_tick(&x, t * NSEC_PER_SEC, (uint32_t)t);
-    CHECK_EQ(n_msgs, 0);
-    ipfix_tick(&x, 11 * NSEC_PER_SEC, 11); // the 10th tick after it
     CHECK_EQ(n_msgs, 1);
+    ipfix_tick(&x, 11 * NSEC_PER_SEC, 11); // the 10th tick after it
+    CHECK_EQ(n_msgs, 2);
     ipfix_add(&x, &rec, 12 * NSEC_PER_SEC, 12);
     ipfix_tick(&x, 100 * NSEC_PER_SEC, 100); // ticks 13 to 99 skipped: the next one sends it
-    CHECK_EQ(n_msgs, 2);
+    CHECK_EQ(n_msgs, 3);
     CHECK_EQ(x.n_records, 2);
 }
 

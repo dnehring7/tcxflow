@@ -116,8 +116,8 @@ void ipfix_set_max_len(struct ipfix_exporter *x, size_t max_len);
                                             uint8_t *buf, size_t len);
 
 /**
- * Call once per second: send the open message once it is about wait_ns old, and start one with the
- * templates if a refresh is due and no message is open, so they are repeated while no flow ends.
+ * Call once per second: send the open message once it is about wait_ns old, and the templates
+ * when a refresh is due, independent of that wait and also while no flow ends.
  *
  * @param x        exporter
  * @param now_ns   CLOCK_MONOTONIC time

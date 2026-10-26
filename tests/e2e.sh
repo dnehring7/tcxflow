@@ -357,9 +357,10 @@ sleep 1
 DAEMON=$!
 PIDS+=("$DAEMON")
 wait_started $DAEMON "$WORK/tcxflow-batch.log"
+sleep 2 # the initial templates are sent, they do not wait
 datagram 65004
 sleep 3 # the flow ended (inactive-timeout 1), its record waits in the open message
-BATCHED=$("${TCX[@]}" --config "$WORK/batch.conf" stats | grep -c '^ipfix messages *0$' || true)
+BATCHED=$("${TCX[@]}" --config "$WORK/batch.conf" stats | grep -c '^flows exported *0$' || true)
 kill -TERM $DAEMON
 wait $DAEMON || true
 kill -TERM $COLL

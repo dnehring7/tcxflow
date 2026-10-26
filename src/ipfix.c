@@ -82,6 +82,8 @@ static uint8_t *put32(uint8_t *p, uint32_t v) { return put16(put16(p, (uint16_t)
 
 static uint8_t *put64(uint8_t *p, uint64_t v) { return put32(put32(p, (uint32_t)(v >> 32)), (uint32_t)v); }
 
+static uint16_t get16(const uint8_t *p) { return (uint16_t)((p[0] << 8) | p[1]); }
+
 static uint8_t *put_bytes(uint8_t *p, const void *src, size_t len) {
     memcpy(p, src, len);
     return p + len;
@@ -180,8 +182,13 @@ void ipfix_tick(struct ipfix_exporter *x, uint64_t now_ns, uint32_t now_sec) {
     // By age, so skipped ticks count; half a tick early, so jitter on the tick grid costs no tick.
     if (x->len && now_ns - x->started_ns + (NSEC_PER_SEC / 2) > x->wait_ns)
         ipfix_flush(x, now_sec);
-    if (!x->len && templates_due(x, now_ns))
+    if (templates_due(x, now_ns)) {
+        ipfix_flush(x, now_sec); // the data waiting goes first
         start_message(x, now_ns, now_sec);
+    }
+    // Templates, also those ipfix_add() started a message with, never wait for batched data.
+    if (x->len > IPFIX_HDR_LEN && get16(x->msg + IPFIX_HDR_LEN) == IPFIX_SET_TEMPLATE)
+        ipfix_flush(x, now_sec);
 }
 
 void ipfix_flush(struct ipfix_exporter *x, uint32_t now_sec) {
