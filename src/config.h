@@ -34,6 +34,10 @@ constexpr int CONFIG_MAX_COLLECTORS = 8;  ///< collectors at most
 constexpr size_t CONFIG_NAME_MAX = 16;    ///< interface name buffer (IFNAMSIZ)
 constexpr size_t CONFIG_STRING_MAX = 256; ///< netns and collector address buffer
 constexpr size_t CONFIG_SOCKET_MAX = 108; ///< control socket path buffer (sizeof(sockaddr_un.sun_path))
+constexpr int CONFIG_N_OPTIONS = 11;      ///< options config_set() knows
+
+/** Names of the options config_set() knows: the command line offers exactly these. */
+extern const char *const config_options[CONFIG_N_OPTIONS];
 
 /** One metered interface. */
 struct iface_config {

@@ -19,6 +19,12 @@
 
 static constexpr size_t LINE_MAX_LEN = 512; ///< longest configuration file line, including the newline
 
+const char *const config_options[CONFIG_N_OPTIONS] = {
+    "interface",        "collector",       "netns",       "inactive-timeout",
+    "active-timeout",   "max-flows",       "cache-flows", "observation-domain",
+    "template-refresh", "export-interval", "socket",
+};
+
 static int set_number(const char *key, const char *value, unsigned long min, unsigned long max, uint32_t *out,
                       char *err, size_t errlen) {
     char *end = nullptr;
@@ -113,6 +119,15 @@ void config_init(struct config *cfg) {
  * here, so they cannot drift apart and every check exists only once.
  */
 int config_set(struct config *cfg, const char *key, const char *value, char *err, size_t errlen) {
+    bool known = false;
+
+    // An option missing from config_options would work in the file but not on the command line.
+    for (int i = 0; i < CONFIG_N_OPTIONS && !known; i++)
+        known = !strcmp(key, config_options[i]);
+    if (!known) {
+        (void)snprintf(err, errlen, "unknown option \"%s\"", key);
+        return -1;
+    }
     if (!strcmp(key, "interface"))
         return add_interface(cfg, value, err, errlen);
     if (!strcmp(key, "collector"))
@@ -145,7 +160,7 @@ int config_set(struct config *cfg, const char *key, const char *value, char *err
         }
         return set_string(key, value, cfg->socket, sizeof(cfg->socket), err, errlen);
     }
-    (void)snprintf(err, errlen, "unknown option \"%s\"", key);
+    (void)snprintf(err, errlen, "option \"%s\" is not implemented", key);
     return -1;
 }
 

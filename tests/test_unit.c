@@ -198,6 +198,24 @@ static void test_config_errors(void) {
     }
 }
 
+/* The command line offers config_options: each must be implemented, and nothing else accepted. */
+static void test_config_options(void) {
+    struct config cfg;
+    char err[256];
+
+    for (int i = 0; i < CONFIG_N_OPTIONS; i++) {
+        err[0] = '\0';
+        config_init(&cfg);
+        (void)config_set(&cfg, config_options[i], "1", err, sizeof(err));
+        if (strstr(err, "unknown") || strstr(err, "not implemented")) {
+            test_errors++;
+            (void)fprintf(stderr, "    option %s: %s\n", config_options[i], err);
+        }
+    }
+    CHECK_EQ(config_set(&cfg, "config", "x", err, sizeof(err)), (unsigned long long)-1);
+    CHECK_STR(err, "unknown option \"config\"");
+}
+
 static void test_config_long_line(void) {
     char text[1024];
     struct config cfg;
@@ -1336,6 +1354,7 @@ int main(void) {
     RUN_TEST(test_config_defaults);
     RUN_TEST(test_config_file);
     RUN_TEST(test_config_errors);
+    RUN_TEST(test_config_options);
     RUN_TEST(test_config_long_line);
     RUN_TEST(test_config_limits);
     RUN_TEST(test_config_validate);
