@@ -103,7 +103,7 @@ endif
 # Sources / targets
 # ------------------------------------------------------------
 SRCS      = src/main.c src/daemon.c src/config.c src/collector.c src/control.c \
-            src/ipfix.c src/cache.c src/meter.c src/util.c src/vlan.c
+            src/ipfix.c src/cache.c src/meter.c src/util.c src/vlan.c src/iface.c
 HEADERS   = $(wildcard src/*.h)
 OBJS      = $(SRCS:src/%.c=build/%.o)
 BPF_OBJ   = build/tcxflow.bpf.o
@@ -113,7 +113,8 @@ SKEL      = build/tcxflow.skel.h
 COMPILE = $(CC) $(TCX_CPPFLAGS) $(CPPFLAGS) $(TCX_CFLAGS) $(CFLAGS) $(SAN_CFLAGS) $(WARN_FLAGS)
 LINK    = $(CC) $(TCX_CFLAGS) $(CFLAGS) $(SAN_CFLAGS) $(WARN_FLAGS) $(LDFLAGS) $(SAN_LDFLAGS)
 
-UNIT_OBJS = build/config.o build/collector.o build/control.o build/ipfix.o build/cache.o build/util.o build/vlan.o
+UNIT_OBJS = build/config.o build/collector.o build/control.o build/ipfix.o build/cache.o build/util.o build/vlan.o \
+            build/iface.o
 BPF_TEST_OBJS = build/meter.o build/util.o
 
 .PHONY: all dev test test-bpf test-e2e test-all indent check-indent lint check docs dist install uninstall clean FORCE

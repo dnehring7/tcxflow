@@ -408,7 +408,7 @@ What matters for flow accounting:
 |---|---|
 | `make` | build `./tcxflow` |
 | `make dev` | strict build of `tcxflow` and the tests: every warning is an error |
-| `make test` | unit tests: configuration, collectors, control socket, VLAN lookup, IPFIX encoding, flow cache; the BPF program compiled natively for BIG TCP, jumbograms and races between CPUs (no root) |
+| `make test` | unit tests: configuration, collectors, control socket, interfaces, VLAN lookup, IPFIX encoding, flow cache; the BPF program compiled natively for BIG TCP, jumbograms and races between CPUs (no root) |
 | `sudo make test-bpf` | BPF program tests: hand-built packets via `BPF_PROG_TEST_RUN` |
 | `sudo make test-e2e` | end-to-end test in network namespaces against nfdump (needs nfdump, iperf3) |
 | `sudo make test-all` | all three |
@@ -484,6 +484,7 @@ Source layout:
 | `src/control.c` | control socket |
 | `src/config.c` | options and configuration file |
 | `src/collector.c` | collector addresses and sockets |
+| `src/iface.c` | metered interfaces: lookup by ifindex, VLAN IDs of their records |
 | `src/vlan.c` | VLAN IDs of VLAN interfaces |
 | `src/util.c` | logging and clocks |
 | `src/main.c` | command line |

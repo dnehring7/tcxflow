@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Dirk Nehring <dnehring@gmx.net>
 /**
  * @file test_unit.c
- * @brief Unit tests: configuration, collector addresses, IPFIX encoding, flow cache
+ * @brief Unit tests: configuration, collectors, control socket, interfaces, IPFIX encoding, flow cache
  *
  * Needs no privileges and no BPF: `make test`.
  */
@@ -28,6 +28,7 @@
 #include "config.h"
 #include "control.h"
 #include "flow.h"
+#include "iface.h"
 #include "ipfix.h"
 #include "test.h"
 #include "util.h"
@@ -1350,6 +1351,58 @@ static void test_cache_init_failed(void) {
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* Interfaces                                                         */
+
+/* Colliding slots are probed past, an ifindex is unique, the table is bounded. */
+static void test_iface_table(void) {
+    static struct iface_table t;
+    const struct iface_config cfg = {.name = "eth0", .dir = {true, false}};
+    struct flow_key k = {.dir = FLOW_DIR_IN, .in_if = 1};
+    struct iface_state *a = nullptr;
+    struct iface_state *b = nullptr;
+
+    CHECK_EQ(iface_add(&t, &cfg, 1, &a), 0);
+    CHECK_EQ(iface_add(&t, &cfg, 1 + IFACE_MAP_SIZE, &b), 0); // the same slot
+    CHECK(iface_of_flow(&t, &k) == a);
+    k.in_if = 1 + IFACE_MAP_SIZE;
+    CHECK(iface_of_flow(&t, &k) == b);
+    k = (struct flow_key){.dir = FLOW_DIR_OUT, .in_if = 1, .out_if = 2};
+    CHECK(iface_of_flow(&t, &k) == nullptr); // egress: the outgoing interface counts
+    CHECK_EQ(iface_add(&t, &cfg, 1, &b), (unsigned long long)-EEXIST);
+    CHECK(b == a);
+    for (unsigned i = 2; t.n < CONFIG_MAX_IFACES; i++)
+        CHECK_EQ(iface_add(&t, &cfg, 1000 + i, &b), 0);
+    CHECK_EQ(iface_add(&t, &cfg, 5000, &b), (unsigned long long)-ENOSPC);
+    CHECK_STR(iface_dir_name(&cfg), "in");
+}
+
+/* VLAN interface IDs first, then the tags in the packet; two levels at most. */
+static void test_iface_vlans(void) {
+    struct iface_state s = {.vlan = 100};
+    const struct flow_key k = {.vlan = 200, .vlan_inner = 300};
+    uint16_t outer = 0;
+    uint16_t inner = 0;
+    char buf[16];
+
+    iface_vlans(nullptr, &k, &outer, &inner); // not a metered interface: the tags only
+    CHECK(outer == 200 && inner == 300);
+    iface_vlans(&s, &k, &outer, &inner);
+    CHECK(outer == 100 && inner == 200);
+    iface_format_vlan(&s, buf, sizeof(buf));
+    CHECK_STR(buf, "100");
+    s.vlan_inner = 101; // QinQ interface
+    iface_vlans(&s, &k, &outer, &inner);
+    CHECK(outer == 100 && inner == 101);
+    iface_format_vlan(&s, buf, sizeof(buf));
+    CHECK_STR(buf, "100.101");
+    s = (struct iface_state){};
+    iface_vlans(&s, &(struct flow_key){}, &outer, &inner);
+    CHECK(outer == 0 && inner == 0);
+    iface_format_vlan(&s, buf, sizeof(buf));
+    CHECK_STR(buf, "-");
+}
+
 int main(void) {
     RUN_TEST(test_config_defaults);
     RUN_TEST(test_config_file);
@@ -1367,6 +1420,8 @@ int main(void) {
     RUN_TEST(test_control_foreign_socket);
     RUN_TEST(test_control_accept);
     RUN_TEST(test_vlan_parse);
+    RUN_TEST(test_iface_table);
+    RUN_TEST(test_iface_vlans);
     RUN_TEST(test_ipfix_message_layout);
     RUN_TEST(test_ipfix_icmp_and_ipv6);
     RUN_TEST(test_ipfix_vlan_ingress);

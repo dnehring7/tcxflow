@@ -36,6 +36,7 @@
 #include "config.h"
 #include "control.h"
 #include "flow.h"
+#include "iface.h"
 #include "ipfix.h"
 #include "meter.h"
 #include "util.h"
@@ -44,31 +45,9 @@
 static constexpr uint64_t FIN_LINGER_NS = 2 * NSEC_PER_SEC; ///< closed TCP flows: export after 2 s without packets
 static constexpr uint32_t CACHE_BUCKETS = 65536;            ///< initial hash buckets of the flow cache
 static constexpr uint32_t CACHE_LIMIT_FACTOR = 8;           ///< the flow cache holds at most this many times max-flows
-static constexpr unsigned IFMAP_SIZE = 128;                 ///< ifindex lookup slots
 static constexpr int DRAIN_RETRIES = 10; ///< failed map switches or drains in a row before tcxflow exits
 static constexpr uint64_t EXPORT_WAIT_NS = 200 * NSEC_PER_MSEC;    ///< tick: longest wait for full send buffers
 static constexpr uint64_t FINAL_EXPORT_WAIT_NS = 5 * NSEC_PER_SEC; ///< the same at shutdown
-
-// Masking with IFMAP_SIZE - 1 needs a power of two; at most half full keeps the probe chains short.
-static_assert((IFMAP_SIZE & (IFMAP_SIZE - 1)) == 0 && IFMAP_SIZE >= 2 * CONFIG_MAX_IFACES, "IFMAP_SIZE");
-
-/** Runtime state of one configured interface. */
-struct iface_state {
-    const struct iface_config *cfg; /**< configuration of the interface */
-    unsigned ifindex;               /**< ifindex inside the namespace at start */
-    struct bpf_link *link[2];       /**< tcx links per enum flow_dir, nullptr = not metered */
-    uint16_t vlan;                  /**< outer VLAN ID if it is a VLAN interface, else 0 */
-    uint16_t vlan_inner;            /**< inner VLAN ID of a stacked (QinQ) VLAN interface */
-    bool gone;                      /**< the interface disappeared */
-    uint64_t packets[2];            /**< packets per enum flow_dir, from drained flows */
-    uint64_t bytes[2];              /**< bytes per enum flow_dir, from drained flows */
-};
-
-/** One slot of the ifindex -> interface table (open addressing). */
-struct ifmap_slot {
-    unsigned ifindex;      /**< key */
-    struct iface_state *s; /**< interface, nullptr = empty slot */
-};
 
 /** Everything the exporter needs; one instance per process. */
 struct daemon {
@@ -76,8 +55,7 @@ struct daemon {
     struct meter meter;                           /**< BPF side */
     struct flow_cache cache;                      /**< flows not yet exported */
     struct ipfix_exporter ipfix;                  /**< IPFIX encoder */
-    struct iface_state ifs[CONFIG_MAX_IFACES];    /**< one per configured interface */
-    struct ifmap_slot ifmap[IFMAP_SIZE];          /**< finds ifs[] by ifindex */
+    struct iface_table ifaces;                    /**< metered interfaces */
     struct collector coll[CONFIG_MAX_COLLECTORS]; /**< one per configured collector */
     int ctl_fd;                                   /**< listening control socket */
     int lock_fd;                                  /**< lock that guards the control socket */
@@ -135,36 +113,6 @@ static void send_message(void *ctx, const uint8_t *msg, size_t len) {
         (void)collector_export(&d->coll[i], msg, len, template_message, d);
 }
 
-/* Called for every drained flow: a hash lookup instead of a scan over up to 64 interfaces. */
-static struct iface_state *iface_lookup(struct daemon *d, unsigned ifindex) {
-    for (unsigned h = ifindex & (IFMAP_SIZE - 1); d->ifmap[h].s; h = (h + 1) & (IFMAP_SIZE - 1))
-        if (d->ifmap[h].ifindex == ifindex)
-            return d->ifmap[h].s;
-    return nullptr;
-}
-
-/*
- * The VLANs of a record: those of a metered VLAN interface come first (its packets carry no tag
- * any more), then the tags the packets still had. So metering eth0 or eth0.100 gives the same
- * VLAN ID, and QinQ on a VLAN interface still shows both levels.
- */
-static void record_vlans(struct daemon *d, const struct flow_key *k, struct ipfix_record *rec) {
-    const struct iface_state *s = iface_lookup(d, k->dir == FLOW_DIR_IN ? k->in_if : k->out_if);
-    uint16_t v[4];
-    int n = 0;
-
-    if (s && s->vlan)
-        v[n++] = s->vlan;
-    if (s && s->vlan_inner)
-        v[n++] = s->vlan_inner;
-    if (k->vlan)
-        v[n++] = k->vlan;
-    if (k->vlan_inner)
-        v[n++] = k->vlan_inner;
-    rec->vlan = n > 0 ? v[0] : 0;
-    rec->vlan_inner = n > 1 ? v[1] : 0;
-}
-
 /* cache_export_fn */
 static void export_flow(void *ctx, const struct flow_entry *e, uint8_t reason) {
     struct daemon *d = ctx;
@@ -179,22 +127,14 @@ static void export_flow(void *ctx, const struct flow_entry *e, uint8_t reason) {
         .end_reason = reason,
     };
 
-    record_vlans(d, &e->key, &rec);
+    iface_vlans(iface_of_flow(&d->ifaces, &e->key), &e->key, &rec.vlan, &rec.vlan_inner);
     ipfix_add(&d->ipfix, &rec, d->now_ns, d->now_sec);
-}
-
-static void iface_insert(struct daemon *d, struct iface_state *s) {
-    unsigned h = s->ifindex & (IFMAP_SIZE - 1);
-
-    while (d->ifmap[h].s)
-        h = (h + 1) & (IFMAP_SIZE - 1);
-    d->ifmap[h] = (struct ifmap_slot){.ifindex = s->ifindex, .s = s};
 }
 
 /* meter_flow_fn: one drained flow goes into the cache and the counters. */
 static void collect_flow(void *ctx, const struct flow_key *key, const struct flow_val *val) {
     struct daemon *d = ctx;
-    struct iface_state *s = iface_lookup(d, key->dir == FLOW_DIR_IN ? key->in_if : key->out_if);
+    struct iface_state *s = iface_of_flow(&d->ifaces, key);
     const int err = cache_add(&d->cache, key, val);
 
     // Cache full (or out of memory): exporting this interval at once loses no count, where
@@ -257,8 +197,8 @@ static void check_target(struct daemon *d) {
     }
     if (d->target_gone) // its interfaces went with the namespace: no message for each of them
         return;
-    for (int i = 0; i < d->cfg->n_ifaces; i++) {
-        struct iface_state *s = &d->ifs[i];
+    for (int i = 0; i < d->ifaces.n; i++) {
+        struct iface_state *s = &d->ifaces.ifs[i];
 
         if (!s->gone && (if_nametoindex(s->cfg->name) != s->ifindex || !links_attached(s))) {
             log_msg("interface %s is gone, exiting", s->cfg->name);
@@ -370,8 +310,8 @@ static void reply_stats(const struct daemon *d, int fd) {
     if (!getrusage(RUSAGE_SELF, &ru))
         cpu_us = timeval_us(ru.ru_utime) + timeval_us(ru.ru_stime);
     format_duration(up_ns / NSEC_PER_SEC, uptime, sizeof(uptime));
-    for (int i = 0; i < d->cfg->n_ifaces; i++)
-        gone += d->ifs[i].gone;
+    for (int i = 0; i < d->ifaces.n; i++)
+        gone += d->ifaces.ifs[i].gone;
     (void)dprintf(fd, "%-18s %s\n", "version", TCXFLOW_VERSION);
     (void)dprintf(fd, "%-18s %s\n", "uptime", uptime);
     // Userspace CPU and memory, to watch the exporter's own cost over months of runtime.
@@ -381,7 +321,7 @@ static void reply_stats(const struct daemon *d, int fd) {
     (void)dprintf(fd, "%-18s last %llu us, max %llu us\n", "tick", (unsigned long long)(d->tick_ns / 1000U),
                   (unsigned long long)(d->tick_max_ns / 1000U));
     (void)dprintf(fd, "%-18s %s\n", "netns", d->cfg->netns[0] ? d->cfg->netns : "-");
-    (void)dprintf(fd, "%-18s %d attached, %d gone\n", "interfaces", d->cfg->n_ifaces - gone, gone);
+    (void)dprintf(fd, "%-18s %d attached, %d gone\n", "interfaces", d->ifaces.n - gone, gone);
     (void)dprintf(fd, "%-18s %llu\n", "packets", (unsigned long long)d->packets);
     (void)dprintf(fd, "%-18s %llu\n", "bytes", (unsigned long long)d->bytes);
     (void)dprintf(fd, "%-18s %llu non-IP, %llu malformed\n", "ignored", (unsigned long long)st[STAT_NONIP],
@@ -399,31 +339,18 @@ static void reply_stats(const struct daemon *d, int fd) {
                       (unsigned long long)d->coll[i].sent, (unsigned long long)d->coll[i].errors);
 }
 
-/* "100", "100.200" (QinQ) or "-". */
-static void format_vlan(const struct iface_state *s, char *buf, size_t len) {
-    if (s->vlan_inner)
-        (void)snprintf(buf, len, "%u.%u", s->vlan, s->vlan_inner);
-    else if (s->vlan)
-        (void)snprintf(buf, len, "%u", s->vlan);
-    else
-        (void)snprintf(buf, len, "-");
-}
-
 static void reply_interfaces(const struct daemon *d, int fd) {
-    static const char *const dirs[] = {"-", "in", "out", "in+out"};
-
     (void)dprintf(fd, "%-15s %7s %-9s %-9s %-8s %14s %16s %14s %16s\n", "INTERFACE", "IFINDEX", "VLAN", "DIRECTION",
                   "STATUS", "IN PACKETS", "IN BYTES", "OUT PACKETS", "OUT BYTES");
-    for (int i = 0; i < d->cfg->n_ifaces; i++) {
-        const struct iface_state *s = &d->ifs[i];
-        const unsigned dir = (s->cfg->dir[FLOW_DIR_IN] ? 1U : 0U) | (s->cfg->dir[FLOW_DIR_OUT] ? 2U : 0U);
+    for (int i = 0; i < d->ifaces.n; i++) {
+        const struct iface_state *s = &d->ifaces.ifs[i];
         char vlan[16];
 
-        format_vlan(s, vlan, sizeof(vlan));
+        iface_format_vlan(s, vlan, sizeof(vlan));
         (void)dprintf(fd, "%-15s %7u %-9s %-9s %-8s %14llu %16llu %14llu %16llu\n", s->cfg->name, s->ifindex, vlan,
-                      dirs[dir], s->gone ? "gone" : "attached", (unsigned long long)s->packets[FLOW_DIR_IN],
-                      (unsigned long long)s->bytes[FLOW_DIR_IN], (unsigned long long)s->packets[FLOW_DIR_OUT],
-                      (unsigned long long)s->bytes[FLOW_DIR_OUT]);
+                      iface_dir_name(s->cfg), s->gone ? "gone" : "attached",
+                      (unsigned long long)s->packets[FLOW_DIR_IN], (unsigned long long)s->bytes[FLOW_DIR_IN],
+                      (unsigned long long)s->packets[FLOW_DIR_OUT], (unsigned long long)s->bytes[FLOW_DIR_OUT]);
     }
 }
 
@@ -463,26 +390,21 @@ static int enter_netns(struct daemon *d) {
 }
 
 static int attach_interfaces(struct daemon *d) {
-    static const char *const dirs[] = {"", "in", "out", "in+out"};
-
     for (int i = 0; i < d->cfg->n_ifaces; i++) {
-        struct iface_state *s = &d->ifs[i];
+        const struct iface_config *cfg = &d->cfg->ifaces[i];
+        const unsigned ifindex = if_nametoindex(cfg->name);
+        struct iface_state *s = nullptr;
         char vlan[16];
 
-        s->cfg = &d->cfg->ifaces[i];
-        s->ifindex = if_nametoindex(s->cfg->name);
-        if (!s->ifindex) {
-            log_msg("interface %s: %s", s->cfg->name, strerror(errno));
+        if (!ifindex) {
+            log_msg("interface %s: %s", cfg->name, strerror(errno));
             return -1;
         }
         // An altname resolves to the same interface: its traffic would be booked to one of them.
-        for (int j = 0; j < i; j++) {
-            if (d->ifs[j].ifindex == s->ifindex) {
-                log_msg("interface %s is the same as %s (ifindex %u)", s->cfg->name, d->ifs[j].cfg->name, s->ifindex);
-                return -1;
-            }
+        if (iface_add(&d->ifaces, cfg, ifindex, &s)) {
+            log_msg("interface %s is the same as %s (ifindex %u)", cfg->name, s->cfg->name, ifindex);
+            return -1;
         }
-        iface_insert(d, s);
         vlan_of_interface(s->cfg->name, &s->vlan, &s->vlan_inner); // in the metered namespace
         for (int dir = FLOW_DIR_IN; dir <= FLOW_DIR_OUT; dir++) {
             if (!s->cfg->dir[dir])
@@ -496,19 +418,18 @@ static int attach_interfaces(struct daemon *d) {
                 return -1;
             }
         }
-        format_vlan(s, vlan, sizeof(vlan));
-        log_msg("metering %s (ifindex %u, %s%s%s)", s->cfg->name, s->ifindex,
-                dirs[(s->cfg->dir[FLOW_DIR_IN] ? 1U : 0U) | (s->cfg->dir[FLOW_DIR_OUT] ? 2U : 0U)],
+        iface_format_vlan(s, vlan, sizeof(vlan));
+        log_msg("metering %s (ifindex %u, %s%s%s)", s->cfg->name, s->ifindex, iface_dir_name(s->cfg),
                 s->vlan ? ", VLAN " : "", s->vlan ? vlan : "");
     }
     return 0;
 }
 
 static void detach_interfaces(struct daemon *d) {
-    for (int i = 0; i < d->cfg->n_ifaces; i++) {
+    for (int i = 0; i < d->ifaces.n; i++) {
         for (int dir = 0; dir < 2; dir++) {
-            (void)bpf_link__destroy(d->ifs[i].link[dir]);
-            d->ifs[i].link[dir] = nullptr;
+            (void)bpf_link__destroy(d->ifaces.ifs[i].link[dir]);
+            d->ifaces.ifs[i].link[dir] = nullptr;
         }
     }
 }
