@@ -1321,6 +1321,49 @@ static void test_cache_growth_and_reuse(void) {
     cache_destroy(&c);
 }
 
+/* Chains hold their entries oldest first, so that evict() finds them at the front. */
+static void check_chains_by_age(const struct flow_cache *c) {
+    uint32_t n = 0;
+
+    for (uint32_t b = 0; b < c->n_buckets; b++) {
+        uint64_t last = 0;
+
+        for (uint32_t i = c->bucket[b]; i != CACHE_NIL; i = c->entries[i].next, n++) {
+            CHECK(c->entries[i].first_ns > last);
+            last = c->entries[i].first_ns;
+        }
+    }
+    CHECK_EQ(n, c->count); // nothing lost on the way
+}
+
+static void test_cache_chain_order(void) {
+    struct flow_cache c;
+    uint32_t count = 0;
+    uint64_t t = 0;
+
+    CHECK_EQ(cache_init(&c, 1, UINT32_MAX, &policy, count_only, &count), 0);
+    for (uint32_t i = 0; i < 5000; i++) { // grows the buckets from 1 to 8192
+        const struct flow_key key = make_key(4, 17, (uint16_t)i, 1);
+        const uint64_t now = ++t;
+        const struct flow_val val = {.first_ns = now, .last_ns = now};
+
+        CHECK_EQ(cache_add(&c, &key, &val), 0);
+    }
+    check_chains_by_age(&c);
+    t += policy.inactive_ns;
+    for (uint32_t i = 0; i < 5000; i += 3) { // a gap ends the flow: evicted, a new one appended
+        const struct flow_key key = make_key(4, 17, (uint16_t)i, 1);
+        const uint64_t now = ++t;
+        const struct flow_val val = {.first_ns = now, .last_ns = now};
+
+        CHECK_EQ(cache_add(&c, &key, &val), 0);
+    }
+    CHECK_EQ(count, 1667);
+    CHECK_EQ(c.count, 5000);
+    check_chains_by_age(&c);
+    cache_destroy(&c);
+}
+
 static void test_cache_limit(void) {
     struct flow_cache c;
     const struct flow_val val = {.first_ns = 1, .last_ns = 1, .packets = 1, .bytes = 64};
@@ -1676,6 +1719,7 @@ int main(void) {
     RUN_TEST(test_cache_merge);
     RUN_TEST(test_cache_expire_reasons);
     RUN_TEST(test_cache_growth_and_reuse);
+    RUN_TEST(test_cache_chain_order);
     RUN_TEST(test_cache_limit);
     RUN_TEST(test_cache_matches_brute_force);
     RUN_TEST(test_cache_expiry_delay_bounded);
