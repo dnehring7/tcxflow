@@ -11,6 +11,7 @@
 #include <errno.h> // IWYU pragma: keep (ENOSPC)
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -18,6 +19,7 @@
 #include <string.h>
 #include <sys/poll.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
@@ -535,56 +537,70 @@ static void test_collector_batch(void) {
     (void)close(c.fd);
 }
 
+static char drained[64][8];             ///< messages the collector received, "fill" left out
+static volatile sig_atomic_t n_drained; ///< entries in drained
+static int drain_fd = -1;               ///< the collector's end of the socket pair
+
+/* SIGALRM: the collector catches up while the sender waits in poll(), which then sees EINTR. */
+static void drain_all([[maybe_unused]] int sig) {
+    const int saved = errno;
+    ssize_t n = 0;
+
+    while (n_drained < 64 && (n = recv(drain_fd, drained[n_drained], sizeof(drained[0]) - 1, MSG_DONTWAIT)) > 0) {
+        drained[n_drained][n] = '\0';
+        if (n != 4) // "fill" is overwritten by the next one
+            n_drained++;
+    }
+    errno = saved;
+}
+
 /*
- * A batch into a full send buffer that holds fewer messages than the batch: every message arrives,
- * once and in order, and the templates once more after the batch stopped early.
+ * A batch into a send buffer with room for 3 of its messages: the batch stops early, the templates
+ * go first again, then every message arrives, once and in order. No second process: a timer
+ * drains the buffer, so what fits when does not depend on scheduling.
  */
 static void test_collector_batch_full_buffer(void) {
+    struct sigaction sa = {.sa_handler = drain_all}; // no SA_RESTART: poll() returns
+    struct itimerval every_20ms = {.it_interval = {.tv_usec = 20000}, .it_value = {.tv_usec = 20000}};
+    const struct itimerval off = {};
     struct collector c = {.name = "slow", .fd = -1};
     struct mmsghdr mm[BATCH_N];
     struct iovec iov[BATCH_N];
     char text[BATCH_N][4];
+    char buf[8];
     int sv[2] = {-1, -1};
-    int sndbuf = 4096; // a few datagrams
-    pid_t pid = -1;
-    int status = -1;
+    unsigned long next = 0;
+    int templates = 0;
 
     CHECK_EQ(socketpair(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, sv), 0);
     if (sv[0] < 0)
         return;
-    CHECK_EQ(setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)), 0);
     c.fd = sv[0];
+    drain_fd = sv[1];
+    n_drained = 0;
     while (send(sv[0], "fill", 4, MSG_DONTWAIT) == 4)
         ;
-    pid = fork();
-    if (pid == 0) { // the collector catches up after 50 ms and checks what it gets
-        struct pollfd pfd = {.fd = sv[1], .events = POLLIN};
-        unsigned next = 0;
-        bool templates = false;
-        char buf[16];
-
-        (void)usleep(50000);
-        while (poll(&pfd, 1, 500) == 1) {
-            const ssize_t n = recv(sv[1], buf, sizeof(buf) - 1, MSG_DONTWAIT);
-
-            if (n <= 0)
-                continue;
-            buf[n] = '\0';
-            templates |= !strcmp(buf, "T");
-            if (strcmp(buf, "fill") != 0 && strcmp(buf, "T") != 0 && strtoul(buf, nullptr, 10) != next++)
-                _exit(1);
-        }
-        if (next != BATCH_N)
-            _exit(2);
-        _exit(templates ? 0 : 3);
-    }
+    for (int i = 0; i < 3; i++) // room for 3 messages
+        CHECK_EQ(recv(sv[1], buf, sizeof(buf), MSG_DONTWAIT), 4);
+    CHECK_EQ(sigaction(SIGALRM, &sa, nullptr), 0);
+    CHECK_EQ(setitimer(ITIMER_REAL, &every_20ms, nullptr), 0);
     c.wait_until_ns = clock_ns(CLOCK_MONOTONIC) + (2 * NSEC_PER_SEC);
     make_batch(mm, iov, text, BATCH_N, 0);
     collector_export_batch(&c, mm, BATCH_N, test_templates, nullptr);
+    (void)setitimer(ITIMER_REAL, &off, nullptr);
+    (void)signal(SIGALRM, SIG_DFL);
+    drain_all(0);
     CHECK_EQ(c.sent, BATCH_N);
     CHECK_EQ(c.errors, 0);
-    (void)waitpid(pid, &status, 0);
-    CHECK_EQ(WIFEXITED(status) ? WEXITSTATUS(status) : -1, 0);
+    for (int i = 0; i < n_drained; i++) {
+        if (!strcmp(drained[i], "T"))
+            templates++;
+        else
+            CHECK_EQ(strtoul(drained[i], nullptr, 10), next++);
+    }
+    CHECK_EQ(next, BATCH_N);
+    CHECK(templates >= 1);
+    CHECK(strcmp(drained[0], "T") != 0); // after the messages that fitted
     (void)close(sv[0]);
     (void)close(sv[1]);
 }
