@@ -391,6 +391,14 @@ wait_started $DAEMON "$WORK/tcxflow-replace.log"
 printf 'link del trep\nlink add trep index %s type veth peer name trep-peer\n' "$REP" | nsx "$DP" ip -batch -
 expect_exit $DAEMON "$WORK/tcxflow-replace.log" "interface trep is gone" "interface replaced (index $REP)"
 
+# --- an interface given twice, by name and by altname: refused at start ------------------
+nsx "$DP" ip link property add dev trep altname trep-alt
+"${TCX[@]}" --netns "$DP" -i trep:in -i trep-alt:out --collector "127.0.0.1:$PORT1" --socket "$WORK/alt.sock" \
+    >"$WORK/tcxflow-alt.log" 2>&1 &
+DAEMON=$!
+PIDS+=("$DAEMON")
+expect_exit $DAEMON "$WORK/tcxflow-alt.log" "interface trep-alt is the same as trep" "interface and its altname"
+
 # --- the namespace is deleted: tcxflow must let go of it and exit with status 1 -----------
 "${TCX[@]}" --config "$WORK/tcxflow.conf" >"$WORK/tcxflow-netns.log" 2>&1 &
 DAEMON=$!

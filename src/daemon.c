@@ -475,6 +475,13 @@ static int attach_interfaces(struct daemon *d) {
             log_msg("interface %s: %s", s->cfg->name, strerror(errno));
             return -1;
         }
+        // An altname resolves to the same interface: its traffic would be booked to one of them.
+        for (int j = 0; j < i; j++) {
+            if (d->ifs[j].ifindex == s->ifindex) {
+                log_msg("interface %s is the same as %s (ifindex %u)", s->cfg->name, d->ifs[j].cfg->name, s->ifindex);
+                return -1;
+            }
+        }
         iface_insert(d, s);
         vlan_of_interface(s->cfg->name, &s->vlan, &s->vlan_inner); // in the metered namespace
         for (int dir = FLOW_DIR_IN; dir <= FLOW_DIR_OUT; dir++) {
