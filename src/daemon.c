@@ -178,10 +178,7 @@ static void warn_if_lost(struct daemon *d) {
     d->lost_seen = st[STAT_FULL_PKTS];
 }
 
-/*
- * The kernel detached the links when the interface was deleted, even if one with its name and index
- * came back. It detaches all links of a device at once: checking one is enough.
- */
+/* Deleting a device detaches all its links, even if a namesake comes back: one link tells. */
 static bool links_attached(const struct iface_state *s) {
     const struct bpf_link *l = s->link[FLOW_DIR_IN] ? s->link[FLOW_DIR_IN] : s->link[FLOW_DIR_OUT];
 
@@ -292,8 +289,7 @@ static void tick(struct daemon *d) {
     (void)cache_expire(&d->cache, d->now_ns, false);
     // The templates are repeated also while no flow ends, so collectors keep them.
     ipfix_refresh(&d->ipfix, d->now_ns, d->now_sec);
-    // Full messages go out at once; a partly filled one waits for more records, so a quiet
-    // exporter sends one packet per interval, not one per second.
+    // A partly filled message waits for more records: a quiet exporter sends one packet per interval.
     if (++d->ticks_unflushed >= d->cfg->export_interval) {
         ipfix_flush(&d->ipfix, d->now_sec);
         d->ticks_unflushed = 0;
@@ -493,7 +489,7 @@ static int start(struct daemon *d) {
     }
     if (d->cfg->netns[0] && enter_netns(d))
         return -1;
-    d->ifreq_fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0); // ioctls act in its namespace; -1: if_nametoindex()
+    d->ifreq_fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0); // ioctls act in its namespace
     return attach_interfaces(d);
 }
 

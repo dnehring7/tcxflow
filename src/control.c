@@ -127,8 +127,7 @@ int control_listen(const char *path, int *lock_fd) {
 }
 
 int control_accept(int listen_fd, char *cmd, size_t cmdlen) {
-    // Non-blocking: poll() bounds the read, and a client that stops reading gets a cut-off reply
-    // instead of stalling the exporter (a reply is a few KiB and normally fits the socket buffer).
+    // Non-blocking: a client that stops reading gets a cut-off reply instead of stalling the exporter.
     const int fd = accept4(listen_fd, nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK);
     const uint64_t deadline = clock_ns(CLOCK_MONOTONIC) + (CMD_TIMEOUT_MS * NSEC_PER_MSEC);
     size_t len = 0;

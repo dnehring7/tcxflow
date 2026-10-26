@@ -74,7 +74,7 @@ typedef size_t (*collector_templates_fn)(void *ctx, unsigned index, uint8_t *buf
  * once more. A message that could not be sent may have carried the templates: they precede the
  * next one. Only this collector gets them, the others are not affected. The first failure and
  * the recovery are logged, not every message. A full send buffer is waited for until
- * c->wait_until_ns, not longer.
+ * c->wait_until_ns.
  *
  * @param c          collector
  * @param msg        message
