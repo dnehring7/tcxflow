@@ -256,4 +256,6 @@ void ipfix_add(struct ipfix_exporter *x, const struct ipfix_record *rec, uint64_
 
     x->len += rlen;
     x->records++;
+    if (x->len + IPFIX_REC_V4 + (x->set_id != IPFIX_TPL_V4 ? 4 : 0) > x->max_len)
+        ipfix_flush(x, now_sec); // full: waiting gains nothing
 }

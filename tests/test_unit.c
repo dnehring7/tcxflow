@@ -948,7 +948,7 @@ static void test_ipfix_tick_wait(void) {
 
 /*
  * A path MTU too small for the templates and a record: the templates go in messages of their
- * own, one per template below 188 bytes, and every message fits.
+ * own, one per template below 188 bytes, and every message fits. A full one is sent at once.
  */
 static void test_ipfix_small_pmtu(void) {
     struct ipfix_exporter x;
@@ -965,8 +965,9 @@ static void test_ipfix_small_pmtu(void) {
         ipfix_init(&x, 1, TPL_REFRESH_NS, 0, capture, nullptr);
         ipfix_set_max_len(&x, limits[l]);
         ipfix_add(&x, &r4, 0, 0);
+        CHECK_EQ(x.len != 0, limits[l] > IPFIX_MSG_MIN); // room for another IPv4 record?
         ipfix_add(&x, &r6, 0, 0);
-        ipfix_flush(&x, 0);
+        CHECK_EQ(x.len, 0); // no room left: sent without a flush
         CHECK(n_msgs >= tpl_msgs + 1);
         for (int i = 0; i < n_msgs && i < MAX_MSGS; i++) {
             CHECK(msg_len[i] <= limits[l]);
