@@ -94,7 +94,7 @@ void ipfix_init(struct ipfix_exporter *x, uint32_t domain, uint64_t refresh_ns, 
 
 /**
  * Limit messages to @p max_len bytes, clamped to IPFIX_MSG_MIN..IPFIX_MSG_MAX; 0 (path MTU
- * unknown) means IPFIX_MSG_UNKNOWN. Takes effect with the next message.
+ * unknown) means IPFIX_MSG_UNKNOWN. A message buffered under a larger limit is split when sent.
  *
  * @param x        exporter
  * @param max_len  message size limit in bytes

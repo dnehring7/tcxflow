@@ -122,6 +122,12 @@ size_t ipfix_template_message(const struct ipfix_exporter *x, unsigned index, ui
     return msg_len;
 }
 
+static void begin_message(struct ipfix_exporter *x) {
+    x->len = IPFIX_HDR_LEN;
+    x->set_id = 0;
+    x->records = 0;
+}
+
 /*
  * Begin a message; include the template set when a refresh is due. The templates travel in
  * the same message as the data, so a collector that just (re)started decodes it at once. Under
@@ -129,9 +135,7 @@ size_t ipfix_template_message(const struct ipfix_exporter *x, unsigned index, ui
  */
 static void start_message(struct ipfix_exporter *x, uint64_t now_ns, uint32_t now_sec) {
     x->started_ns = now_ns;
-    x->len = IPFIX_HDR_LEN;
-    x->set_id = 0;
-    x->records = 0;
+    begin_message(x);
     if (!templates_due(x, now_ns))
         return;
     if (IPFIX_HDR_LEN + TPL_SET_LEN + 4 + IPFIX_REC_V6 <= x->max_len) {
@@ -156,6 +160,18 @@ static void close_set(struct ipfix_exporter *x) {
     if (x->set_id)
         (void)put16(x->msg + x->set_off + 2, (uint16_t)(x->len - x->set_off));
     x->set_id = 0;
+}
+
+static void open_set(struct ipfix_exporter *x, uint16_t id) {
+    close_set(x);
+    x->set_off = x->len;
+    (void)put16(x->msg + x->len, id);
+    x->len += 4;
+    x->set_id = id;
+}
+
+static bool fits(const struct ipfix_exporter *x, size_t rlen, uint16_t id) {
+    return x->len + rlen + (x->set_id != id ? 4 : 0) <= x->max_len;
 }
 
 void ipfix_init(struct ipfix_exporter *x, uint32_t domain, uint64_t refresh_ns, uint64_t wait_ns, ipfix_send_fn send,
@@ -191,17 +207,9 @@ void ipfix_tick(struct ipfix_exporter *x, uint64_t now_ns, uint32_t now_sec) {
         ipfix_flush(x, now_sec);
 }
 
-void ipfix_flush(struct ipfix_exporter *x, uint32_t now_sec) {
-    uint8_t *p = x->msg;
-
-    if (!x->len)
-        return;
-    if (x->len == IPFIX_HDR_LEN) { // the templates went on their own and no record followed
-        x->len = 0;
-        return;
-    }
+static void send_message(struct ipfix_exporter *x, uint32_t now_sec) {
     close_set(x);
-    (void)put_header(p, x->len, now_sec, x->seq, x->domain);
+    (void)put_header(x->msg, x->len, now_sec, x->seq, x->domain);
     x->send(x->ctx, x->msg, x->len);
     // Counted even when sending failed: the sequence number counts data records (RFC 7011), so a
     // collector sees the gap and knows that records were lost.
@@ -210,6 +218,49 @@ void ipfix_flush(struct ipfix_exporter *x, uint32_t now_sec) {
     x->n_records += x->records;
     x->msgs_since_tpl++;
     x->len = 0;
+}
+
+/* The path MTU shrank while the message was buffered: repack its fixed-length records in order. */
+static void split_message(struct ipfix_exporter *x, uint32_t now_sec) {
+    uint8_t msg[IPFIX_MSG_MAX];
+    const size_t len = x->len;
+
+    memcpy(msg, x->msg, len);
+    begin_message(x);
+    for (size_t off = IPFIX_HDR_LEN, end = 0; off < len; off = end) {
+        const uint16_t id = get16(msg + off);
+        size_t rlen = id == IPFIX_TPL_V4 ? IPFIX_REC_V4 : IPFIX_REC_V6;
+
+        if (id == IPFIX_SET_TEMPLATE)
+            rlen = TPL_LEN;
+        end = off + get16(msg + off + 2);
+        for (size_t pos = off + 4; pos < end; pos += rlen) {
+            if (!fits(x, rlen, id)) {
+                send_message(x, now_sec);
+                begin_message(x);
+            }
+            if (x->set_id != id)
+                open_set(x, id);
+            memcpy(x->msg + x->len, msg + pos, rlen);
+            x->len += rlen;
+            x->records += id != IPFIX_SET_TEMPLATE;
+        }
+    }
+    send_message(x, now_sec);
+}
+
+void ipfix_flush(struct ipfix_exporter *x, uint32_t now_sec) {
+    if (!x->len)
+        return;
+    if (x->len == IPFIX_HDR_LEN) { // the templates went on their own and no record followed
+        x->len = 0;
+        return;
+    }
+    close_set(x); // complete the set lengths split_message() reads
+    if (x->len > x->max_len)
+        split_message(x, now_sec);
+    else
+        send_message(x, now_sec);
 }
 
 void ipfix_add(struct ipfix_exporter *x, const struct ipfix_record *rec, uint64_t now_ns, uint32_t now_sec) {
@@ -225,17 +276,12 @@ void ipfix_add(struct ipfix_exporter *x, const struct ipfix_record *rec, uint64_
 
     if (!x->len)
         start_message(x, now_ns, now_sec);
-    if (x->len + rlen + (x->set_id != id ? 4 : 0) > x->max_len) {
+    if (!fits(x, rlen, id)) {
         ipfix_flush(x, now_sec);
         start_message(x, now_ns, now_sec);
     }
-    if (x->set_id != id) { // open a data set for this template
-        close_set(x);
-        x->set_off = x->len;
-        (void)put16(x->msg + x->len, id);
-        x->len += 4;
-        x->set_id = id;
-    }
+    if (x->set_id != id)
+        open_set(x, id);
 
     p = put_bytes(x->msg + x->len, k->src, alen);
     p = put_bytes(p, k->dst, alen);
@@ -256,6 +302,6 @@ void ipfix_add(struct ipfix_exporter *x, const struct ipfix_record *rec, uint64_
 
     x->len += rlen;
     x->records++;
-    if (x->len + IPFIX_REC_V4 + (x->set_id != IPFIX_TPL_V4 ? 4 : 0) > x->max_len)
+    if (!fits(x, IPFIX_REC_V4, IPFIX_TPL_V4))
         ipfix_flush(x, now_sec); // full: waiting gains nothing
 }

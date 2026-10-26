@@ -982,6 +982,49 @@ static void test_ipfix_small_pmtu(void) {
     }
 }
 
+/*
+ * The path MTU shrinks while templates and mixed sets wait in a message: sent by a flush or by the
+ * next record, they arrive in messages that fit, templates first, every record once and in order.
+ */
+static void test_ipfix_shrunk_pmtu(void) {
+    struct ipfix_exporter x;
+    const struct flow_key k4 = make_key(4, 17, 1, 2);
+    const struct flow_key k6 = make_key(6, 17, 1, 2);
+
+    for (int by_add = 0; by_add < 2; by_add++) {
+        const uint64_t n = 12 + (uint64_t)by_add;
+        uint64_t next = 1;
+
+        n_msgs = 0;
+        ipfix_init(&x, 1, TPL_REFRESH_NS, 0, capture, nullptr);
+        for (uint64_t i = 1; i <= n; i++) {
+            const struct ipfix_record r = {.key = i % 3 ? &k4 : &k6, .packets = i}; // v4, v4, v6, ...
+
+            ipfix_add(&x, &r, 0, 0);
+            if (i == 12)
+                ipfix_set_max_len(&x, IPFIX_MSG_MIN);
+        }
+        CHECK_EQ(n_msgs != 0, by_add != 0); // the 13th record sent them
+        ipfix_flush(&x, 0);
+        CHECK(n_msgs > 1 && n_msgs < MAX_MSGS);
+        for (int m = 0; m < n_msgs && m < MAX_MSGS; m++) {
+            CHECK(msg_len[m] <= IPFIX_MSG_MIN);
+            CHECK_EQ(get16(msgs[m] + 2), msg_len[m]);
+            CHECK_EQ(get32(msgs[m] + 8), next - 1); // data records before
+            for (size_t off = IPFIX_HDR_LEN; off < msg_len[m]; off += get16(msgs[m] + off + 2)) {
+                const uint16_t id = get16(msgs[m] + off);
+                const size_t rlen = id == IPFIX_TPL_V4 ? IPFIX_REC_V4 : IPFIX_REC_V6;
+
+                CHECK(id != IPFIX_SET_TEMPLATE || next == 1);
+                for (size_t r = off + 4; id != IPFIX_SET_TEMPLATE && r < off + get16(msgs[m] + off + 2); r += rlen)
+                    CHECK_EQ(get64(msgs[m] + r + (id == IPFIX_TPL_V4 ? 35 : 59)), next++); // packets
+            }
+        }
+        CHECK_EQ(next, n + 1);
+        CHECK_EQ(x.n_records, n);
+    }
+}
+
 /* What a collector gets before the next message when it needs the templates. */
 static void test_ipfix_template_message(void) {
     struct ipfix_exporter x;
@@ -1466,6 +1509,7 @@ int main(void) {
     RUN_TEST(test_ipfix_refresh_idle);
     RUN_TEST(test_ipfix_tick_wait);
     RUN_TEST(test_ipfix_small_pmtu);
+    RUN_TEST(test_ipfix_shrunk_pmtu);
     RUN_TEST(test_ipfix_template_message);
     RUN_TEST(test_ipfix_max_len);
     RUN_TEST(test_cache_merge);
