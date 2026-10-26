@@ -5,7 +5,7 @@
 # Build directly from tarball: rpmbuild -ta tcxflow-<version>.tar.gz
 
 Name:           tcxflow
-Version:        1.1.0
+Version:        1.2.0
 Release:        1%{?dist}
 Summary:        Lightweight eBPF-based IPFIX flow accounting
 

@@ -11,7 +11,7 @@
 #include <stdint.h>
 #include <time.h>
 
-#define TCXFLOW_VERSION "v1.1.0" ///< release version, the same as its git tag; the Makefile reads it from here
+#define TCXFLOW_VERSION "v1.2.0" ///< release version, the same as its git tag; the Makefile reads it from here
 
 constexpr uint64_t NSEC_PER_SEC = 1'000'000'000; ///< nanoseconds per second
 constexpr uint64_t NSEC_PER_MSEC = 1'000'000;    ///< nanoseconds per millisecond

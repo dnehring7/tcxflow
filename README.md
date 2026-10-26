@@ -158,7 +158,7 @@ a metered interface or the namespace that disappears, flow maps that cannot be d
 
 ```
 $ sudo tcxflow stats
-version            v1.1.0
+version            v1.2.0
 uptime             3h 12m 5s
 cpu                41.718 s (0.362% of one CPU), max RSS 14212 KiB
 tick               last 1873 us, max 9541 us
@@ -443,15 +443,15 @@ What matters for flow accounting:
 
 ### Releases and packages
 
-The version is in `src/util.h` (`TCXFLOW_VERSION`, for example `v1.1.0`, the same as the git
+The version is in `src/util.h` (`TCXFLOW_VERSION`, for example `v1.2.0`, the same as the git
 tag) and in `tcxflow.spec` (`Version`, without the `v`). To release, set both, commit, and push
-the tag, for example `v1.1.0`. Only such a tag starts `.github/workflows/release.yml`, which
+the tag, for example `v1.2.0`. Only such a tag starts `.github/workflows/release.yml`, which
 fails if the code is not at the version of the tag:
 
 - **ci**: all of `ci.yml`, including the BPF and end-to-end tests on the runner's kernel.
 - **rpm** (AlmaLinux 10) and **deb** (Debian 13): the package, with the distribution's compiler
-  flags and the unit tests; it must install and report the version of the tag. The rpm job
-  signs the RPMs.
+  flags and the unit tests; it must install, report the version of the tag and be stripped.
+  The rpm job signs the RPMs.
 - **publish**: signed APT and DNF repositories on GitHub Pages, with a page with the
   installation commands, and the packages attached to the GitHub release.
 
@@ -464,11 +464,11 @@ The packages also build by hand. `debian/changelog` is written by the release wo
 first:
 
 ```bash
-dch --create --package tcxflow --newversion 1.1.0 --distribution trixie 'Release 1.1.0'
-dpkg-buildpackage -us -uc -b            # ../tcxflow_1.1.0_amd64.deb
+dch --create --package tcxflow --newversion 1.2.0 --distribution trixie 'Release 1.2.0'
+dpkg-buildpackage -us -uc -b            # ../tcxflow_1.2.0_amd64.deb
 
-git archive --prefix=tcxflow-1.1.0/ -o tcxflow-1.1.0.tar.gz v1.1.0
-rpmbuild -ta tcxflow-1.1.0.tar.gz       # ~/rpmbuild/RPMS/x86_64/
+git archive --prefix=tcxflow-1.2.0/ -o tcxflow-1.2.0.tar.gz v1.2.0
+rpmbuild -ta tcxflow-1.2.0.tar.gz       # ~/rpmbuild/RPMS/x86_64/
 ```
 
 Source layout:
