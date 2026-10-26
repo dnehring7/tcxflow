@@ -76,20 +76,25 @@ int collector_split(const char *spec, char *host, size_t hostlen, char *port, si
     return 0;
 }
 
-size_t collector_max_message(int fd) {
-    struct sockaddr_storage sa = {};
-    socklen_t salen = sizeof(sa);
+/* Called every tick: the family never changes, only the MTU does. */
+size_t collector_max_message(struct collector *c) {
     int mtu = 0;
     socklen_t mtulen = sizeof(mtu);
 
-    if (getsockname(fd, (struct sockaddr *)&sa, &salen))
-        return 0;
-    if (sa.ss_family == AF_INET6) {
-        if (getsockopt(fd, IPPROTO_IPV6, IPV6_MTU, &mtu, &mtulen) || mtu <= IPV6_UDP_HDRS)
+    if (!c->family) {
+        struct sockaddr_storage sa = {};
+        socklen_t salen = sizeof(sa);
+
+        if (getsockname(c->fd, (struct sockaddr *)&sa, &salen))
+            return 0;
+        c->family = sa.ss_family;
+    }
+    if (c->family == AF_INET6) {
+        if (getsockopt(c->fd, IPPROTO_IPV6, IPV6_MTU, &mtu, &mtulen) || mtu <= IPV6_UDP_HDRS)
             return 0;
         return (size_t)mtu - IPV6_UDP_HDRS;
     }
-    if (getsockopt(fd, IPPROTO_IP, IP_MTU, &mtu, &mtulen) || mtu <= IPV4_UDP_HDRS)
+    if (getsockopt(c->fd, IPPROTO_IP, IP_MTU, &mtu, &mtulen) || mtu <= IPV4_UDP_HDRS)
         return 0;
     return (size_t)mtu - IPV4_UDP_HDRS;
 }

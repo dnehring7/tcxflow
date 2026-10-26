@@ -17,6 +17,7 @@
 struct collector {
     const char *name;       /**< address as configured, for log messages */
     int fd;                 /**< connected UDP socket from collector_open(), -1 = none */
+    int family;             /**< address family of fd, 0 = not looked up yet */
     uint64_t sent;          /**< messages sent */
     uint64_t errors;        /**< messages that could not be sent */
     uint64_t failing;       /**< messages not sent since the last one that was */
@@ -57,13 +58,13 @@ typedef size_t (*collector_templates_fn)(void *ctx, unsigned index, uint8_t *buf
 [[nodiscard]] int collector_open(const char *spec, char *err, size_t errlen);
 
 /**
- * Largest IPFIX message that fits the path MTU of a socket from collector_open() without
- * fragmentation (the route MTU, lowered by what path MTU discovery has learned).
+ * Largest IPFIX message that fits the path MTU of a collector's socket without fragmentation
+ * (the route MTU, lowered by what path MTU discovery has learned).
  *
- * @param fd  collector socket
+ * @param c  collector, its family is looked up on the first call
  * @return message size in bytes, 0 if unknown
  */
-[[nodiscard]] size_t collector_max_message(int fd);
+[[nodiscard]] size_t collector_max_message(struct collector *c);
 
 /**
  * Send one message to a collector, with the templates first where it needs them.

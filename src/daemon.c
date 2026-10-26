@@ -218,11 +218,11 @@ static void set_export_deadline(struct daemon *d, uint64_t wait_ns) {
 }
 
 /* The largest message that fits the path MTU of every collector: all get the same messages. */
-static size_t export_max_len(const struct daemon *d) {
+static size_t export_max_len(struct daemon *d) {
     size_t max = 0;
 
     for (int i = 0; i < d->cfg->n_collectors; i++) {
-        const size_t m = collector_max_message(d->coll[i].fd);
+        const size_t m = collector_max_message(&d->coll[i]);
 
         if (m && (!max || m < max))
             max = m;

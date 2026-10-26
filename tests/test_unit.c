@@ -463,16 +463,27 @@ static void test_collector_waits_for_full_buffer(void) {
     (void)close(sv[1]);
 }
 
-/* The path MTU of a connected collector socket is known. */
+/* The path MTU of a connected collector socket is known, less the IPv4 or IPv6 and UDP headers. */
 static void test_collector_max_message(void) {
+    const char *const specs[] = {"127.0.0.1:9", "[::1]:9"};
+    const size_t hdrs[] = {28, 48};
     char err[256];
-    const int fd = collector_open("127.0.0.1:9", err, sizeof(err));
 
-    CHECK(fd >= 0);
-    if (fd < 0)
-        return;
-    CHECK(collector_max_message(fd) > IPFIX_MSG_MAX); // loopback: about 64 KiB
-    (void)close(fd);
+    for (int i = 0; i < 2; i++) {
+        struct collector c = {.fd = collector_open(specs[i], err, sizeof(err))};
+        int mtu = 0;
+        socklen_t mtulen = sizeof(mtu);
+
+        if (c.fd < 0) {
+            CHECK(i == 1); // a kernel without IPv6
+            continue;
+        }
+        CHECK(collector_max_message(&c) > IPFIX_MSG_MAX); // loopback: about 64 KiB
+        CHECK_EQ(c.family, i ? AF_INET6 : AF_INET);       // looked up once
+        CHECK_EQ(getsockopt(c.fd, i ? IPPROTO_IPV6 : IPPROTO_IP, i ? IPV6_MTU : IP_MTU, &mtu, &mtulen), 0);
+        CHECK_EQ(collector_max_message(&c), (size_t)mtu - hdrs[i]);
+        (void)close(c.fd);
+    }
 }
 
 /* One owner per control socket; a stale socket is replaced, anything else is left alone. */
