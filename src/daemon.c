@@ -545,10 +545,11 @@ static int start(struct daemon *d) {
         return -1;
     }
     // Small configurations start small; the bucket array doubles as the cache grows.
-    if (cache_init(&d->cache, d->cfg->max_flows < CACHE_BUCKETS ? d->cfg->max_flows : CACHE_BUCKETS,
-                   d->cfg->cache_flows ? d->cfg->cache_flows : d->cfg->max_flows * CACHE_LIMIT_FACTOR, &policy,
-                   export_flow, d)) {
-        log_msg("out of memory");
+    rc = cache_init(&d->cache, d->cfg->max_flows < CACHE_BUCKETS ? d->cfg->max_flows : CACHE_BUCKETS,
+                    d->cfg->cache_flows ? d->cfg->cache_flows : d->cfg->max_flows * CACHE_LIMIT_FACTOR, &policy,
+                    export_flow, d);
+    if (rc) {
+        log_msg("flow cache: %s", strerror(-rc));
         return -1;
     }
     if (d->cfg->netns[0] && enter_netns(d))

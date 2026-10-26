@@ -1317,6 +1317,21 @@ static void test_cache_memory(void) {
     cache_destroy(&c);
 }
 
+/* A cache whose initialisation failed is empty and usable: stop() still drains into it. */
+static void test_cache_init_failed(void) {
+    struct flow_cache c;
+    const struct flow_val val = {.first_ns = 1, .last_ns = 1, .packets = 1};
+    const struct flow_key k = make_key(4, 17, 1, 1);
+
+    for (int i = 0; i < 2; i++) {
+        CHECK_EQ(cache_init(&c, i ? UINT32_MAX : 0, 100000, &policy, collect, nullptr), (unsigned long long)-EINVAL);
+        CHECK_EQ(cache_add(&c, &k, &val), (unsigned long long)-ENOMEM);
+        CHECK_EQ(cache_expire(&c, 1, true), 0);
+        CHECK_EQ(cache_memory(&c), 0);
+        cache_destroy(&c);
+    }
+}
+
 int main(void) {
     RUN_TEST(test_config_defaults);
     RUN_TEST(test_config_file);
@@ -1353,5 +1368,6 @@ int main(void) {
     RUN_TEST(test_cache_older_interval_later);
     RUN_TEST(test_cache_delayed_interval);
     RUN_TEST(test_cache_memory);
+    RUN_TEST(test_cache_init_failed);
     return test_summary();
 }

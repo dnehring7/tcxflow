@@ -7,7 +7,7 @@
 
 #include "cache.h"
 
-#include <errno.h> // IWYU pragma: keep (ENOMEM, ENOSPC)
+#include <errno.h> // IWYU pragma: keep (EINVAL, ENOMEM, ENOSPC)
 #include <stdbit.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -89,13 +89,15 @@ int cache_init(struct flow_cache *c, uint32_t n_buckets, uint32_t limit, const s
     // initialisation failed.
     c->free_list = CACHE_NIL;
     c->idle = c->fin = c->age = (struct cache_list){CACHE_NIL, CACHE_NIL};
+    if (!n_buckets || n_buckets > UINT32_MAX / 2 + 1) // stdc_bit_ceil() would wrap to 0
+        return -EINVAL;
     if (getentropy(&c->seed, sizeof(c->seed)))
         return -errno;
     c->limit = limit;
-    c->n_buckets = stdc_bit_ceil(n_buckets);
-    c->bucket = malloc(c->n_buckets * sizeof(*c->bucket));
+    c->bucket = malloc(stdc_bit_ceil(n_buckets) * sizeof(*c->bucket));
     if (!c->bucket)
         return -ENOMEM;
+    c->n_buckets = stdc_bit_ceil(n_buckets);
     memset(c->bucket, 0xff, c->n_buckets * sizeof(*c->bucket));
     return 0;
 }
@@ -198,6 +200,8 @@ int cache_add(struct flow_cache *c, const struct flow_key *key, const struct flo
     struct flow_entry *e = nullptr;
     uint32_t i = 0;
 
+    if (!c->bucket) // cache_init() failed
+        return -ENOMEM;
     if (val->first_ns < c->batch_min_ns)
         c->batch_min_ns = val->first_ns;
     if (val->last_ns > c->batch_max_ns)
