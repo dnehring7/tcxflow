@@ -34,6 +34,10 @@ constexpr int CONFIG_MAX_COLLECTORS = 8;  ///< collectors at most
 constexpr size_t CONFIG_NAME_MAX = 16;    ///< interface name buffer (IFNAMSIZ)
 constexpr size_t CONFIG_STRING_MAX = 256; ///< netns and collector address buffer
 constexpr size_t CONFIG_SOCKET_MAX = 108; ///< control socket path buffer (sizeof(sockaddr_un.sun_path))
+constexpr int CONFIG_N_OPTIONS = 11;      ///< options config_set() knows
+
+/** Names of the options config_set() knows: the command line offers exactly these. */
+extern const char *const config_options[CONFIG_N_OPTIONS];
 
 /** One metered interface. */
 struct iface_config {
@@ -50,11 +54,12 @@ struct config {
     int n_collectors;                                          /**< entries used in collectors */
     uint32_t observation_domain;                               /**< IPFIX observation domain id */
     uint32_t template_refresh;                                 /**< templates at least every so many seconds */
-    uint32_t inactive_timeout;                                 /**< seconds */
-    uint32_t active_timeout;                                   /**< seconds */
-    uint32_t max_flows;                                        /**< BPF flow table size per one-second interval */
-    uint32_t cache_flows;                                      /**< flows cached at most, 0 = 8 * max_flows */
-    char socket[CONFIG_SOCKET_MAX];                            /**< control socket path */
+    uint32_t export_interval;       /**< seconds a partly filled message waits for more records */
+    uint32_t inactive_timeout;      /**< seconds */
+    uint32_t active_timeout;        /**< seconds */
+    uint32_t max_flows;             /**< BPF flow table size per one-second interval */
+    uint32_t cache_flows;           /**< flows cached at most, 0 = 8 * max_flows */
+    char socket[CONFIG_SOCKET_MAX]; /**< control socket path */
 };
 
 /**

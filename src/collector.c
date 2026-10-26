@@ -8,16 +8,20 @@
 #include "collector.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
+#include "ipfix.h"
 #include "util.h"
 
 static constexpr int SNDBUF_SIZE = 4 << 20;     ///< socket send buffer, absorbs export bursts
@@ -73,47 +77,74 @@ int collector_split(const char *spec, char *host, size_t hostlen, char *port, si
     return 0;
 }
 
-size_t collector_max_message(int fd) {
-    struct sockaddr_storage sa = {};
-    socklen_t salen = sizeof(sa);
+/* Called every tick: the family never changes, only the MTU does. */
+size_t collector_max_message(struct collector *c) {
     int mtu = 0;
     socklen_t mtulen = sizeof(mtu);
 
-    if (getsockname(fd, (struct sockaddr *)&sa, &salen))
-        return 0;
-    if (sa.ss_family == AF_INET6) {
-        if (getsockopt(fd, IPPROTO_IPV6, IPV6_MTU, &mtu, &mtulen) || mtu <= IPV6_UDP_HDRS)
+    if (!c->family) {
+        struct sockaddr_storage sa = {};
+        socklen_t salen = sizeof(sa);
+
+        if (getsockname(c->fd, (struct sockaddr *)&sa, &salen))
+            return 0;
+        c->family = sa.ss_family;
+    }
+    if (c->family == AF_INET6) {
+        if (getsockopt(c->fd, IPPROTO_IPV6, IPV6_MTU, &mtu, &mtulen) || mtu <= IPV6_UDP_HDRS)
             return 0;
         return (size_t)mtu - IPV6_UDP_HDRS;
     }
-    if (getsockopt(fd, IPPROTO_IP, IP_MTU, &mtu, &mtulen) || mtu <= IPV4_UDP_HDRS)
+    if (getsockopt(c->fd, IPPROTO_IP, IP_MTU, &mtu, &mtulen) || mtu <= IPV4_UDP_HDRS)
         return 0;
     return (size_t)mtu - IPV4_UDP_HDRS;
 }
 
-static int send_templates(const struct collector *c, collector_templates_fn templates, void *ctx) {
+/* A full send buffer is a burst (many flows ending at once), not a lost collector: wait, bounded. */
+static ssize_t send_msg(const struct collector *c, const void *msg, size_t len) {
+    ssize_t n = send(c->fd, msg, len, MSG_DONTWAIT);
+
+    while (n < 0 && errno == EAGAIN) {
+        const uint64_t now = clock_ns(CLOCK_MONOTONIC);
+        struct pollfd pfd = {.fd = c->fd, .events = POLLOUT};
+        uint64_t ms = 0;
+
+        if (now >= c->wait_until_ns)
+            break;
+        ms = (c->wait_until_ns - now + NSEC_PER_MSEC - 1) / NSEC_PER_MSEC;
+        // EINTR is a stop signal: the final export still needs this message.
+        if (poll(&pfd, 1, ms > INT_MAX ? INT_MAX : (int)ms) < 0 && errno != EINTR)
+            return -1;
+        n = send(c->fd, msg, len, MSG_DONTWAIT);
+    }
+    return n;
+}
+
+/* The templates that msg needs: with its sequence number, as the encoder has moved on since it queued msg. */
+static int send_templates(const struct collector *c, collector_templates_fn templates, void *ctx, const void *msg,
+                          size_t len) {
     uint8_t buf[TEMPLATE_MSG_MAX];
     size_t n = 0;
 
-    for (unsigned i = 0; (n = templates(ctx, i, buf, sizeof(buf))) != 0; i++)
-        if (send(c->fd, buf, n, MSG_DONTWAIT) < 0)
+    for (unsigned i = 0; (n = templates(ctx, i, buf, sizeof(buf))) != 0; i++) {
+        if (n >= IPFIX_HDR_LEN && len >= IPFIX_HDR_LEN) // not in the tests' mock messages
+            memcpy(buf + IPFIX_HDR_SEQ, (const uint8_t *)msg + IPFIX_HDR_SEQ, sizeof(uint32_t));
+        if (send_msg(c, buf, n) < 0)
             return -1;
+    }
     return 0;
 }
 
-int collector_export(struct collector *c, const void *msg, size_t len, collector_templates_fn templates, void *ctx) {
-    ssize_t n = 0;
-
-    if (c->templates_due && !send_templates(c, templates, ctx))
-        c->templates_due = false;
-    n = send(c->fd, msg, len, MSG_DONTWAIT);
+/* The rest of collector_export(), once the first attempt to send the message returned n. */
+static int export_result(struct collector *c, const void *msg, size_t len, collector_templates_fn templates, void *ctx,
+                         ssize_t n) {
     if (n < 0 && errno == ECONNREFUSED) {
         if (!c->refused)
             log_msg("collector %s: port unreachable, the collector is down or restarting", c->name);
         c->refused = true;
         // While it is still down, the templates draw the next refusal, which this send then reports.
-        (void)send_templates(c, templates, ctx);
-        n = send(c->fd, msg, len, MSG_DONTWAIT);
+        (void)send_templates(c, templates, ctx, msg, len);
+        n = send_msg(c, msg, len);
     }
     if (n < 0) {
         const int err = errno;
@@ -136,6 +167,39 @@ int collector_export(struct collector *c, const void *msg, size_t len, collector
     return 0;
 }
 
+int collector_export(struct collector *c, const void *msg, size_t len, collector_templates_fn templates, void *ctx) {
+    if (c->templates_due && !send_templates(c, templates, ctx, msg, len))
+        c->templates_due = false;
+    return export_result(c, msg, len, templates, ctx, send_msg(c, msg, len));
+}
+
+void collector_export_batch(struct collector *c, struct mmsghdr *msgs, unsigned n, collector_templates_fn templates,
+                            void *ctx) {
+    for (unsigned i = 0; i < n;) {
+        const struct iovec *v = msgs[i].msg_hdr.msg_iov;
+        int k = 0;
+
+        if (c->templates_due || c->failing || c->refused) { // message by message until all is well
+            (void)collector_export(c, v->iov_base, v->iov_len, templates, ctx);
+            i++;
+            continue;
+        }
+        k = sendmmsg(c->fd, msgs + i, n - i, MSG_DONTWAIT);
+        if (k < 0) { // nothing sent, errno tells why: as for a single message
+            (void)export_result(c, v->iov_base, v->iov_len, templates, ctx,
+                                errno == EAGAIN ? send_msg(c, v->iov_base, v->iov_len) : -1);
+            i++;
+            continue;
+        }
+        c->sent += (unsigned)k;
+        i += (unsigned)k;
+        // Stopped early: a full buffer, or an error it reported to nobody, maybe a refusal by a
+        // restarted collector. The templates go first again, the next message waits for room.
+        if (i < n)
+            c->templates_due = true;
+    }
+}
+
 int collector_open(const char *spec, char *err, size_t errlen) {
     struct addrinfo hints = {.ai_socktype = SOCK_DGRAM, .ai_flags = AI_NUMERICSERV};
     struct addrinfo *ai = nullptr;
@@ -154,7 +218,7 @@ int collector_open(const char *spec, char *err, size_t errlen) {
         (void)snprintf(err, errlen, "collector %s: %s", spec, gai_strerror(rc));
         return -1;
     }
-    // Non-blocking: a collector that does not keep up must never stall the one-second tick.
+    // Non-blocking: a slow collector stalls the tick only until the collector_export() deadline.
     // Connected: the route is looked up once, and errors are reported per collector. Every
     // address is tried: an IPv6 address first in the list may have no route on this host.
     for (const struct addrinfo *cur = ai; cur; cur = cur->ai_next) {

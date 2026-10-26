@@ -14,7 +14,7 @@
 #   make lint             static analysis with clang-tidy (checks in .clang-tidy) and shellcheck
 #   make check            check-indent, lint, make dev and the unit tests
 #   make docs             Doxygen documentation in docs/html
-#   make dist             source tarball ../tcxflow-VERSION.tar.gz
+#   make dist             source tarball ../tcxflow-VERSION.tar.gz of the committed HEAD
 #   sudo make install     binary, systemd unit and example configuration
 #   sudo make uninstall   remove the binary and the systemd unit
 #   make clean            remove everything the build created
@@ -27,8 +27,9 @@
 # PREFIX, SBINDIR, UNITDIR, SYSCONFDIR, DESTDIR, CC, CLANG, BPFTOOL, PKG_CONFIG, CLANG_FORMAT,
 # CLANG_TIDY, SHELLCHECK, NJOBS.
 
-# The release version without the "v" of its tag (vX.Y.Z), as tarballs and packages use it.
-VERSION = $(shell sed -n 's/^\#define TCXFLOW_VERSION "v\([^"]*\)".*/\1/p' src/util.h)
+# The release version without the "v" of its tag (vX.Y.Z), as tarballs and packages use it; that
+# of HEAD, which dist packs, not of an uncommitted edit.
+VERSION = $(shell git show HEAD:src/util.h | sed -n 's/^\#define TCXFLOW_VERSION "v\([^"]*\)".*/\1/p')
 
 PREFIX     ?= /usr/local
 SBINDIR    ?= $(PREFIX)/sbin
@@ -60,7 +61,7 @@ LDLIBS         = $(shell $(PKG_CONFIG) --libs libbpf 2>/dev/null || echo -lbpf)
 
 # BPF: the bpf target has no system include directories; those of the host, as clang reports
 # them, include Debian's multiarch directory with the asm/ headers (as libbpf-bootstrap does).
-# Instruction set v4 needs Linux 6.6, which tcx needs anyway.
+# Instruction set v4 (clang's default: v1 up to 19, v3 since 20) needs Linux 6.6, which tcx needs anyway.
 BPF_INCLUDES := $(shell $(CLANG) -v -E - </dev/null 2>&1 | \
                   sed -n '/<...> search starts here:/,/End of search list./{ s| \(/.*\)|-idirafter \1|p }')
 BPF_CFLAGS    = -std=gnu23 -O2 -g -Wall -target bpf -mcpu=v4 -Isrc $(LIBBPF_CFLAGS) $(BPF_INCLUDES)
@@ -103,7 +104,7 @@ endif
 # Sources / targets
 # ------------------------------------------------------------
 SRCS      = src/main.c src/daemon.c src/config.c src/collector.c src/control.c \
-            src/ipfix.c src/cache.c src/meter.c src/util.c src/vlan.c
+            src/ipfix.c src/cache.c src/meter.c src/util.c src/vlan.c src/iface.c
 HEADERS   = $(wildcard src/*.h)
 OBJS      = $(SRCS:src/%.c=build/%.o)
 BPF_OBJ   = build/tcxflow.bpf.o
@@ -113,7 +114,8 @@ SKEL      = build/tcxflow.skel.h
 COMPILE = $(CC) $(TCX_CPPFLAGS) $(CPPFLAGS) $(TCX_CFLAGS) $(CFLAGS) $(SAN_CFLAGS) $(WARN_FLAGS)
 LINK    = $(CC) $(TCX_CFLAGS) $(CFLAGS) $(SAN_CFLAGS) $(WARN_FLAGS) $(LDFLAGS) $(SAN_LDFLAGS)
 
-UNIT_OBJS = build/config.o build/collector.o build/control.o build/ipfix.o build/cache.o build/util.o build/vlan.o
+UNIT_OBJS = build/config.o build/collector.o build/control.o build/ipfix.o build/cache.o build/util.o build/vlan.o \
+            build/iface.o
 BPF_TEST_OBJS = build/meter.o build/util.o
 
 .PHONY: all dev test test-bpf test-e2e test-all indent check-indent lint check docs dist install uninstall clean FORCE
@@ -163,7 +165,7 @@ build/meter.o: $(SKEL)
 # Tests
 # ------------------------------------------------------------
 build/test_unit: tests/test_unit.c tests/test.h $(UNIT_OBJS) $(HEADERS) build/.flags
-	$(LINK) $(TCX_CPPFLAGS) $(CPPFLAGS) $< $(UNIT_OBJS) -o $@
+	$(LINK) $(TCX_CPPFLAGS) $(CPPFLAGS) $< $(UNIT_OBJS) -Wl,--wrap=sendmmsg -o $@
 
 build/test_bpf: tests/test_bpf.c tests/test.h $(BPF_TEST_OBJS) $(HEADERS) build/.flags
 	$(LINK) $(TCX_CPPFLAGS) $(CPPFLAGS) $< $(BPF_TEST_OBJS) -o $@ $(LDLIBS)
@@ -260,11 +262,9 @@ docs:
 	@command -v doxygen >/dev/null 2>&1 || { echo "doxygen not found"; exit 1; }
 	@doxygen && echo "Doxygen documentation written to docs/html/index.html"
 
-dist: clean
-	@-rm -f ../tcxflow-$(VERSION).tar.gz
-	@cd .. && tar czf tcxflow-$(VERSION).tar.gz \
-		--transform='s|^$(notdir $(CURDIR))|tcxflow-$(VERSION)|' \
-		--exclude=.git --exclude='*.tar.gz' $(notdir $(CURDIR))
+# The committed tree only: no build output, no local files .gitignore hides (rpmbuild -ta takes it as is).
+dist:
+	@git archive --prefix=tcxflow-$(VERSION)/ -o ../tcxflow-$(VERSION).tar.gz HEAD
 	@echo "Distribution package created as ../tcxflow-$(VERSION).tar.gz"
 
 install: tcxflow

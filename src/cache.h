@@ -95,12 +95,13 @@ constexpr uint64_t CACHE_BATCH_SPREAD_NS = 1'250'000'000; ///< a batch spreading
  * Set up an empty cache that holds at most @p limit flows.
  *
  * @param c          cache to set up
- * @param n_buckets  initial hash buckets, rounded up to a power of two
+ * @param n_buckets  initial hash buckets (1 to 2^31), rounded up to a power of two
  * @param limit      flows cached at most
  * @param policy     when flows end
  * @param export_fn  receives every flow that ended, from cache_add() or cache_expire()
  * @param ctx        passed to @p export_fn
- * @return 0, -ENOMEM, or -errno if no random hash seed is available
+ * @return 0, -EINVAL, -ENOMEM, or -errno if no random hash seed is available; after a failure
+ *         the cache is empty, cache_add() fails with -ENOMEM
  */
 [[nodiscard]] int cache_init(struct flow_cache *c, uint32_t n_buckets, uint32_t limit,
                              const struct expire_policy *policy, cache_export_fn export_fn, void *ctx);

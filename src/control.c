@@ -23,9 +23,8 @@
 
 #include "util.h"
 
-static constexpr time_t IO_TIMEOUT_SEC = 2;          ///< send and receive timeout of a control connection
-static constexpr uint64_t CMD_TIMEOUT_MS = 200;      ///< the daemon waits this long at most for a command
-static constexpr uint64_t NSEC_PER_MSEC = 1'000'000; ///< nanoseconds per millisecond
+static constexpr time_t IO_TIMEOUT_SEC = 2;     ///< send and receive timeout of a control connection
+static constexpr uint64_t CMD_TIMEOUT_MS = 200; ///< the daemon waits this long at most for a command
 
 static int make_addr(const char *path, struct sockaddr_un *sa) {
     memset(sa, 0, sizeof(*sa));
@@ -128,13 +127,13 @@ int control_listen(const char *path, int *lock_fd) {
 }
 
 int control_accept(int listen_fd, char *cmd, size_t cmdlen) {
-    const int fd = accept4(listen_fd, nullptr, nullptr, SOCK_CLOEXEC);
+    // Non-blocking: a client that stops reading gets a cut-off reply instead of stalling the exporter.
+    const int fd = accept4(listen_fd, nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK);
     const uint64_t deadline = clock_ns(CLOCK_MONOTONIC) + (CMD_TIMEOUT_MS * NSEC_PER_MSEC);
     size_t len = 0;
 
     if (fd < 0)
         return -1;
-    set_timeouts(fd);
     // One deadline for the whole command: a slow client must not hold up the exporter.
     while (len + 1 < cmdlen && !memchr(cmd, '\n', len)) {
         const uint64_t now = clock_ns(CLOCK_MONOTONIC);
@@ -150,9 +149,6 @@ int control_accept(int listen_fd, char *cmd, size_t cmdlen) {
     }
     cmd[len] = '\0';
     cmd[strcspn(cmd, "\r\n")] = '\0';
-    // Replies are written non-blocking: a client that stops reading gets a cut-off reply, it
-    // cannot stall the exporter (a reply is a few KiB and normally fits the socket buffer).
-    (void)fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
     return fd;
 }
 

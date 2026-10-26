@@ -31,7 +31,11 @@ struct cli_option {
     const char *value; /**< option argument */
 };
 
+/* Defaults from config_init(), so the help text cannot drift from them. */
 static void usage(FILE *out) {
+    struct config def;
+
+    config_init(&def);
     (void)fprintf(out,
                   "tcxflow %s - Lightweight eBPF-based IPFIX flow accounting for Linux\n"
                   "\n"
@@ -47,12 +51,13 @@ static void usage(FILE *out) {
                   "  -i, --interface IF[:in|:out]  meter interface IF (default: both directions)\n"
                   "      --collector HOST:PORT     send IPFIX to this collector ([ipv6]:port, default port 4739)\n"
                   "      --netns NAME|PATH         the interfaces live in this network namespace\n"
-                  "      --inactive-timeout SEC    export a flow after SEC seconds without packets (15)\n"
-                  "      --active-timeout SEC      export long flows every SEC seconds (1800)\n"
-                  "      --max-flows N             BPF flow table size per second (131072)\n"
+                  "      --inactive-timeout SEC    export a flow after SEC seconds without packets (%u)\n"
+                  "      --active-timeout SEC      export long flows every SEC seconds (%u)\n"
+                  "      --max-flows N             BPF flow table size per second (%u)\n"
                   "      --cache-flows N           flows cached until they end, at most (8 * max-flows)\n"
-                  "      --observation-domain ID   IPFIX observation domain id (1)\n"
-                  "      --template-refresh SEC    send the IPFIX templates at least every SEC seconds (60)\n"
+                  "      --observation-domain ID   IPFIX observation domain id (%u)\n"
+                  "      --template-refresh SEC    send the IPFIX templates at least every SEC seconds (%u)\n"
+                  "      --export-interval SEC     send a partly filled IPFIX message after SEC seconds (%u)\n"
                   "  -s, --socket PATH             control socket (%s)\n"
                   "\n"
                   "Other options:\n"
@@ -61,7 +66,8 @@ static void usage(FILE *out) {
                   "  -v, --verbose       show libbpf messages\n"
                   "  -V, --version       print the version and exit\n"
                   "  -h, --help          show this help\n",
-                  TCXFLOW_VERSION, CONFIG_DEFAULT_SOCKET, CONFIG_DEFAULT_PATH);
+                  TCXFLOW_VERSION, def.inactive_timeout, def.active_timeout, def.max_flows, def.observation_domain,
+                  def.template_refresh, def.export_interval, CONFIG_DEFAULT_SOCKET, CONFIG_DEFAULT_PATH);
 }
 
 /* Validate the configuration and that every collector address resolves. */
@@ -103,23 +109,14 @@ static int cmd_query(const char *socket_path, const char *cmd) {
  * @return 0 on success, 1 on errors, 2 on a usage error
  */
 int main(int argc, char **argv) {
-    static const struct option options[] = {
-        {"interface", required_argument, nullptr, 0},
-        {"collector", required_argument, nullptr, 0},
-        {"netns", required_argument, nullptr, 0},
-        {"inactive-timeout", required_argument, nullptr, 0},
-        {"active-timeout", required_argument, nullptr, 0},
-        {"max-flows", required_argument, nullptr, 0},
-        {"cache-flows", required_argument, nullptr, 0},
-        {"observation-domain", required_argument, nullptr, 0},
-        {"template-refresh", required_argument, nullptr, 0},
-        {"socket", required_argument, nullptr, 0},
+    static const struct option other[] = {
         {"config", required_argument, nullptr, 'c'},
         {"verbose", no_argument, nullptr, 'v'},
         {"version", no_argument, nullptr, 'V'},
         {"help", no_argument, nullptr, 'h'},
-        {nullptr, 0, nullptr, 0},
     };
+    // The configuration options, then the others; the last entry stays zero (end of the table).
+    static struct option options[CONFIG_N_OPTIONS + (sizeof(other) / sizeof(other[0])) + 1];
     static struct config cfg;
     static struct cli_option cli[256];
     const char *config_path = nullptr;
@@ -131,6 +128,9 @@ int main(int argc, char **argv) {
     int opt = 0;
     int idx = 0;
 
+    for (int i = 0; i < CONFIG_N_OPTIONS; i++)
+        options[i] = (struct option){.name = config_options[i], .has_arg = required_argument};
+    memcpy(&options[CONFIG_N_OPTIONS], other, sizeof(other));
     while ((opt = getopt_long(argc, argv, "i:s:c:vVh", options, &idx)) != -1) {
         const char *key = nullptr;
 

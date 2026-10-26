@@ -2,8 +2,10 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2026 Dirk Nehring <dnehring@gmx.net>
 
-# All hardening, bindnow included: tcxflow runs with high privileges.
-export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+# All hardening, bindnow included: tcxflow runs with high privileges. LTO and fortify level 3 as
+# in the RPM (dpkg sets level 2).
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all optimize=+lto
+export DEB_CPPFLAGS_MAINT_APPEND = -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3
 
 %:
 	dh $@

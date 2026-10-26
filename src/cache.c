@@ -7,7 +7,7 @@
 
 #include "cache.h"
 
-#include <errno.h> // IWYU pragma: keep (ENOMEM, ENOSPC)
+#include <errno.h> // IWYU pragma: keep (EINVAL, ENOMEM, ENOSPC)
 #include <stdbit.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -89,13 +89,15 @@ int cache_init(struct flow_cache *c, uint32_t n_buckets, uint32_t limit, const s
     // initialisation failed.
     c->free_list = CACHE_NIL;
     c->idle = c->fin = c->age = (struct cache_list){CACHE_NIL, CACHE_NIL};
+    if (!n_buckets || n_buckets > UINT32_MAX / 2 + 1) // stdc_bit_ceil() would wrap to 0
+        return -EINVAL;
     if (getentropy(&c->seed, sizeof(c->seed)))
         return -errno;
     c->limit = limit;
-    c->n_buckets = stdc_bit_ceil(n_buckets);
-    c->bucket = malloc(c->n_buckets * sizeof(*c->bucket));
+    c->bucket = malloc(stdc_bit_ceil(n_buckets) * sizeof(*c->bucket));
     if (!c->bucket)
         return -ENOMEM;
+    c->n_buckets = stdc_bit_ceil(n_buckets);
     memset(c->bucket, 0xff, c->n_buckets * sizeof(*c->bucket));
     return 0;
 }
@@ -107,8 +109,9 @@ void cache_destroy(struct flow_cache *c) {
 }
 
 /*
- * Double the bucket array so chains stay short (load factor <= 1). A failed allocation is not
- * an error: lookups only get slower, so the cache keeps working under memory pressure.
+ * Double the bucket array so chains stay short (load factor <= 1). Each chain splits in two in
+ * order, so the oldest entries stay first. A failed allocation is not an error: lookups only get
+ * slower, so the cache keeps working under memory pressure.
  */
 static void grow_buckets(struct flow_cache *c) {
     const uint32_t n = c->n_buckets * 2;
@@ -118,17 +121,18 @@ static void grow_buckets(struct flow_cache *c) {
         c->grow_failed = true;
         return;
     }
-    memset(nb, 0xff, n * sizeof(*nb));
     for (uint32_t b = 0; b < c->n_buckets; b++) {
-        uint32_t next = CACHE_NIL;
+        uint32_t *lo = &nb[b];
+        uint32_t *hi = &nb[b + c->n_buckets];
 
-        for (uint32_t i = c->bucket[b]; i != CACHE_NIL; i = next) {
-            const uint32_t h = hash_key(c, &c->entries[i].key) & (n - 1);
+        for (uint32_t i = c->bucket[b]; i != CACHE_NIL; i = c->entries[i].next) {
+            uint32_t **tail = hash_key(c, &c->entries[i].key) & c->n_buckets ? &hi : &lo;
 
-            next = c->entries[i].next;
-            c->entries[i].next = nb[h];
-            nb[h] = i;
+            **tail = i;
+            *tail = &c->entries[i].next;
         }
+        *lo = CACHE_NIL;
+        *hi = CACHE_NIL;
     }
     free(c->bucket);
     c->bucket = nb;
@@ -183,7 +187,7 @@ static void evict(struct flow_cache *c, uint32_t i, uint8_t reason) {
     uint32_t *link = &c->bucket[hash_key(c, &e->key) & (c->n_buckets - 1)];
 
     c->export_fn(c->ctx, e, reason);
-    while (*link != i) // chains are short: load factor <= 1
+    while (*link != i) // short: entries expire roughly in chain order, see cache_add()
         link = &c->entries[*link].next;
     *link = e->next;
     list_remove(c, idle_list_of(c, e), i);
@@ -196,13 +200,16 @@ static void evict(struct flow_cache *c, uint32_t i, uint8_t reason) {
 int cache_add(struct flow_cache *c, const struct flow_key *key, const struct flow_val *val) {
     const uint32_t b = hash_key(c, key) & (c->n_buckets - 1);
     struct flow_entry *e = nullptr;
+    uint32_t prev = CACHE_NIL;
     uint32_t i = 0;
 
+    if (!c->bucket) // cache_init() failed
+        return -ENOMEM;
     if (val->first_ns < c->batch_min_ns)
         c->batch_min_ns = val->first_ns;
     if (val->last_ns > c->batch_max_ns)
         c->batch_max_ns = val->last_ns;
-    for (i = c->bucket[b]; i != CACHE_NIL; i = c->entries[i].next) {
+    for (i = c->bucket[b]; i != CACHE_NIL; prev = i, i = c->entries[i].next) {
         uint8_t reason = 0;
 
         e = &c->entries[i];
@@ -233,6 +240,8 @@ int cache_add(struct flow_cache *c, const struct flow_key *key, const struct flo
         list_push_tail(c, idle_list_of(c, e), i);
         return 0;
     }
+    for (i = prev == CACHE_NIL ? c->bucket[b] : c->entries[prev].next; i != CACHE_NIL; i = c->entries[i].next)
+        prev = i; // after an eviction: the rest of the chain
     // A bound, so that a flood of spoofed sources cannot make the daemon grow without limit.
     if (c->count >= c->limit)
         return -ENOSPC;
@@ -247,8 +256,10 @@ int cache_add(struct flow_cache *c, const struct flow_key *key, const struct flo
     e->tcp_flags = (uint16_t)val->tcp_flags;
     e->ecn = val->ecn;
     e->batch = c->batch;
-    e->next = c->bucket[b];
-    c->bucket[b] = i;
+    // Appended, not pushed: evict() then finds the oldest entries at the front of their chains
+    // instead of walking past newer ones, a cache miss each.
+    e->next = CACHE_NIL;
+    *(prev == CACHE_NIL ? &c->bucket[b] : &c->entries[prev].next) = i;
     list_push_tail(c, idle_list_of(c, e), i);
     list_push_tail(c, &c->age, i);
     if (++c->count > c->n_buckets)

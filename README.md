@@ -115,6 +115,7 @@ active-timeout   120
 | `cache-flows` | flows cached until they end, at most (1024–134217728) | 8 × `max-flows` |
 | `observation-domain` | IPFIX observation domain id (0–4294967295) | 1 |
 | `template-refresh` | send the IPFIX templates at least this often, in seconds (1–86400) | 60 |
+| `export-interval` | send a partly filled IPFIX message after this many seconds (0–60; 0: every second) | 10 |
 | `socket` | control socket for `stats` and `interfaces`, an absolute path | `/run/tcxflow/tcxflow.sock` |
 
 `option value` and `option = value` are both accepted, and `#` starts a comment.
@@ -157,7 +158,7 @@ a metered interface or the namespace that disappears, flow maps that cannot be d
 
 ```
 $ sudo tcxflow stats
-version            v1.1.0
+version            v1.2.0
 uptime             3h 12m 5s
 cpu                41.718 s (0.362% of one CPU), max RSS 14212 KiB
 tick               last 1873 us, max 9541 us
@@ -256,13 +257,14 @@ Two IPFIX templates are used, 256 for IPv4 and 257 for IPv6. Each record contain
 - `flowStartMilliseconds`, `flowEndMilliseconds`, `flowEndReason`
 
 Templates are repeated every 60 seconds (`template-refresh`) and every 20 messages, also while
-no flow ends. A collector that refused a message (it was down or restarted) gets them before
+no flow ends; they never wait for `export-interval`. A collector that refused a message (it was down or restarted) gets them before
 that message is sent again, and one that missed a message before the next; the other
 collectors are not affected. tcxflow logs when a collector refuses or messages cannot be sent,
 and when it is reachable again. Messages are sized to fit the path MTU towards every collector
 (112 to 1400 bytes; 464 if it is unknown, for 512-byte packets as RFC 7011 asks), so exporting
 through a VPN or tunnel does not fragment them. Below 284 bytes the templates go in messages
-of their own.
+of their own. When many flows end at once and a socket buffer fills up, tcxflow waits for the
+collector up to 200 ms per second, and up to 5 seconds for the final export at shutdown.
 
 How the counting works:
 
@@ -378,9 +380,9 @@ What matters for flow accounting:
   `ip netns attach dataplane <pid>`, and use `netns dataplane`.
 - **Interfaces and namespaces that disappear.** If an interface disappears (also when it is
   replaced by one with the same name and index: the kernel detaches the BPF programs from the
-  old one), or the namespace is deleted or rebuilt, tcxflow exports what it has and exits with
-  status 1, so it never
-  keeps a deleted namespace (and the interfaces in it) alive. systemd restarts it, and it
+  old one), its programs are detached (`bpftool link detach`), or the namespace is deleted or
+  rebuilt, tcxflow exports what it has and exits with status 1, so it never keeps a deleted
+  namespace (and the interfaces in it) alive. systemd restarts it, and it
   attaches again. If another unit creates the namespace, order tcxflow after it with
   `systemctl edit tcxflow` (`After=` and `Requires=`).
 
@@ -406,7 +408,7 @@ What matters for flow accounting:
 |---|---|
 | `make` | build `./tcxflow` |
 | `make dev` | strict build of `tcxflow` and the tests: every warning is an error |
-| `make test` | unit tests: configuration, collectors, control socket, VLAN lookup, IPFIX encoding, flow cache; the BPF program compiled natively for BIG TCP, jumbograms and races between CPUs (no root) |
+| `make test` | unit tests: configuration, collectors, control socket, interfaces, VLAN lookup, IPFIX encoding, flow cache; the BPF program compiled natively for BIG TCP, jumbograms and races between CPUs (no root) |
 | `sudo make test-bpf` | BPF program tests: hand-built packets via `BPF_PROG_TEST_RUN` |
 | `sudo make test-e2e` | end-to-end test in network namespaces against nfdump (needs nfdump, iperf3) |
 | `sudo make test-all` | all three |
@@ -415,7 +417,7 @@ What matters for flow accounting:
 | `make lint` | clang-tidy (`.clang-tidy`), one stamp per file, parallel (`NJOBS=`); shellcheck for `tests/*.sh` |
 | `make check` | `check-indent`, `lint`, `make dev` and the unit tests |
 | `make docs` | Doxygen documentation in `docs/html` |
-| `make dist` | source tarball `../tcxflow-VERSION.tar.gz` |
+| `make dist` | source tarball `../tcxflow-VERSION.tar.gz` of the committed `HEAD` |
 | `sudo make install` | binary, systemd unit and example configuration (`PREFIX`, `DESTDIR`) |
 | `sudo make uninstall` | remove the binary and the unit |
 | `make clean` | remove everything the build created |
@@ -441,15 +443,15 @@ What matters for flow accounting:
 
 ### Releases and packages
 
-The version is in `src/util.h` (`TCXFLOW_VERSION`, for example `v1.1.0`, the same as the git
+The version is in `src/util.h` (`TCXFLOW_VERSION`, for example `v1.2.0`, the same as the git
 tag) and in `tcxflow.spec` (`Version`, without the `v`). To release, set both, commit, and push
-the tag, for example `v1.1.0`. Only such a tag starts `.github/workflows/release.yml`, which
+the tag, for example `v1.2.0`. Only such a tag starts `.github/workflows/release.yml`, which
 fails if the code is not at the version of the tag:
 
 - **ci**: all of `ci.yml`, including the BPF and end-to-end tests on the runner's kernel.
 - **rpm** (AlmaLinux 10) and **deb** (Debian 13): the package, with the distribution's compiler
-  flags and the unit tests; it must install and report the version of the tag. The rpm job
-  signs the RPMs.
+  flags and the unit tests; it must install, report the version of the tag and be stripped.
+  The rpm job signs the RPMs.
 - **publish**: signed APT and DNF repositories on GitHub Pages, with a page with the
   installation commands, and the packages attached to the GitHub release.
 
@@ -462,11 +464,11 @@ The packages also build by hand. `debian/changelog` is written by the release wo
 first:
 
 ```bash
-dch --create --package tcxflow --newversion 1.1.0 --distribution trixie 'Release 1.1.0'
-dpkg-buildpackage -us -uc -b            # ../tcxflow_1.1.0_amd64.deb
+dch --create --package tcxflow --newversion 1.2.0 --distribution trixie 'Release 1.2.0'
+dpkg-buildpackage -us -uc -b            # ../tcxflow_1.2.0_amd64.deb
 
-git archive --prefix=tcxflow-1.1.0/ -o tcxflow-1.1.0.tar.gz v1.1.0
-rpmbuild -ta tcxflow-1.1.0.tar.gz       # ~/rpmbuild/RPMS/x86_64/
+git archive --prefix=tcxflow-1.2.0/ -o tcxflow-1.2.0.tar.gz v1.2.0
+rpmbuild -ta tcxflow-1.2.0.tar.gz       # ~/rpmbuild/RPMS/x86_64/
 ```
 
 Source layout:
@@ -482,6 +484,7 @@ Source layout:
 | `src/control.c` | control socket |
 | `src/config.c` | options and configuration file |
 | `src/collector.c` | collector addresses and sockets |
+| `src/iface.c` | metered interfaces: lookup by ifindex, VLAN IDs of their records |
 | `src/vlan.c` | VLAN IDs of VLAN interfaces |
 | `src/util.c` | logging and clocks |
 | `src/main.c` | command line |

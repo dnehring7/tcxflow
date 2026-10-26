@@ -2,14 +2,16 @@
 // Copyright (C) 2026 Dirk Nehring <dnehring@gmx.net>
 /**
  * @file test_unit.c
- * @brief Unit tests: configuration, collector addresses, IPFIX encoding, flow cache
+ * @brief Unit tests: configuration, collectors, control socket, interfaces, IPFIX encoding, flow cache
  *
  * Needs no privileges and no BPF: `make test`.
  */
 
 #include <arpa/inet.h>
 #include <errno.h> // IWYU pragma: keep (ENOSPC)
+#include <fcntl.h>
 #include <netinet/in.h>
+#include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -17,6 +19,7 @@
 #include <string.h>
 #include <sys/poll.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
@@ -27,6 +30,7 @@
 #include "config.h"
 #include "control.h"
 #include "flow.h"
+#include "iface.h"
 #include "ipfix.h"
 #include "test.h"
 #include "util.h"
@@ -116,6 +120,7 @@ static void test_config_defaults(void) {
     CHECK_EQ(cfg.active_timeout, 1800);
     CHECK_EQ(cfg.max_flows, 131072);
     CHECK_EQ(cfg.observation_domain, 1);
+    CHECK_EQ(cfg.export_interval, 10);
     CHECK_STR(cfg.netns, "");
     CHECK_STR(cfg.socket, CONFIG_DEFAULT_SOCKET);
 }
@@ -134,6 +139,7 @@ static void test_config_file(void) {
                                "active-timeout   120\n"
                                "max-flows 65536\n"
                                "observation-domain 4711\n"
+                               "export-interval 1\n"
                                "socket /run/test.sock\n";
     struct config cfg;
     char err[256] = "";
@@ -155,6 +161,7 @@ static void test_config_file(void) {
     CHECK_EQ(cfg.active_timeout, 120);
     CHECK_EQ(cfg.max_flows, 65536);
     CHECK_EQ(cfg.observation_domain, 4711);
+    CHECK_EQ(cfg.export_interval, 1);
     CHECK_STR(cfg.socket, "/run/test.sock");
     CHECK_EQ(config_validate(&cfg, err, sizeof(err)), 0);
 }
@@ -177,6 +184,7 @@ static void test_config_errors(void) {
         {"active-timeout -5\n", "must be a number"},
         {"max-flows 100\n", "max-flows must be a number from 1024"},
         {"observation-domain 4294967296\n", "must be a number"},
+        {"export-interval 61\n", "export-interval must be a number from 0 to 60"},
         {"netns relative/path\n", "netns must be a name or an absolute path"},
         {"socket run/x.sock\n", "socket must be an absolute path"},
     };
@@ -191,6 +199,24 @@ static void test_config_errors(void) {
             (void)fprintf(stderr, "    case %zu: error \"%s\" does not contain \"%s\"\n", i, err, cases[i].message);
         }
     }
+}
+
+/* The command line offers config_options: each must be implemented, and nothing else accepted. */
+static void test_config_options(void) {
+    struct config cfg;
+    char err[256];
+
+    for (int i = 0; i < CONFIG_N_OPTIONS; i++) {
+        err[0] = '\0';
+        config_init(&cfg);
+        (void)config_set(&cfg, config_options[i], "1", err, sizeof(err));
+        if (strstr(err, "unknown") || strstr(err, "not implemented")) {
+            test_errors++;
+            (void)fprintf(stderr, "    option %s: %s\n", config_options[i], err);
+        }
+    }
+    CHECK_EQ(config_set(&cfg, "config", "x", err, sizeof(err)), (unsigned long long)-1);
+    CHECK_STR(err, "unknown option \"config\"");
 }
 
 static void test_config_long_line(void) {
@@ -285,7 +311,6 @@ static int udp_listen(uint16_t *port) {
     return fd;
 }
 
-/* A collector that was down (ICMP port unreachable) and is back must get the next message. */
 /* collector_templates_fn: one template message, "T", for the tests. */
 static size_t test_templates([[maybe_unused]] void *ctx, unsigned index, uint8_t *buf, size_t len) {
     if (index > 0 || len < 1)
@@ -395,16 +420,317 @@ static void test_collector_templates_after_failure(void) {
     (void)close(rx);
 }
 
-/* The path MTU of a connected collector socket is known. */
-static void test_collector_max_message(void) {
-    char err[256];
-    const int fd = collector_open("127.0.0.1:9", err, sizeof(err));
+/* A full send buffer is waited for until the deadline. Unix datagrams: UDP loopback never fills. */
+static void test_collector_waits_for_full_buffer(void) {
+    struct collector c = {.name = "slow", .fd = -1};
+    int sv[2] = {-1, -1};
+    uint64_t start = 0;
+    pid_t pid = -1;
+    int status = 0;
 
-    CHECK(fd >= 0);
-    if (fd < 0)
+    CHECK_EQ(socketpair(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, sv), 0);
+    if (sv[0] < 0)
         return;
-    CHECK(collector_max_message(fd) > IPFIX_MSG_MAX); // loopback: about 64 KiB
-    (void)close(fd);
+    c.fd = sv[0];
+    while (send(sv[0], "fill", 4, MSG_DONTWAIT) == 4)
+        ;
+    CHECK_EQ(errno, EAGAIN);
+    CHECK_EQ(collector_export(&c, "now", 3, test_templates, nullptr), -1); // no deadline: no waiting
+    CHECK_EQ(errno, EAGAIN);
+    start = clock_ns(CLOCK_MONOTONIC);
+    c.wait_until_ns = start + (100 * NSEC_PER_MSEC);
+    CHECK_EQ(collector_export(&c, "never", 5, test_templates, nullptr), -1); // no room until the deadline
+    CHECK_EQ(errno, EAGAIN);
+    CHECK(clock_ns(CLOCK_MONOTONIC) - start >= 100 * NSEC_PER_MSEC);
+    CHECK(clock_ns(CLOCK_MONOTONIC) - start < NSEC_PER_SEC);
+    start = clock_ns(CLOCK_MONOTONIC); // before the fork: the child's delay counts from here
+    pid = fork();
+    if (pid == 0) { // the collector catches up after 50 ms
+        struct pollfd pfd = {.fd = sv[1], .events = POLLIN};
+        char buf[16];
+
+        (void)usleep(50000);
+        while (poll(&pfd, 1, 500) == 1)
+            (void)recv(sv[1], buf, sizeof(buf), MSG_DONTWAIT);
+        _exit(0);
+    }
+    c.wait_until_ns = start + (2 * NSEC_PER_SEC);
+    CHECK_EQ(collector_export(&c, "later", 5, test_templates, nullptr), 0);
+    CHECK(clock_ns(CLOCK_MONOTONIC) - start >= 40 * NSEC_PER_MSEC); // it waited for room
+    CHECK(!c.templates_due);                                        // and sent the templates
+    CHECK_EQ(c.sent, 1);
+    CHECK_EQ(c.errors, 2);
+    (void)waitpid(pid, &status, 0);
+    (void)close(sv[0]);
+    (void)close(sv[1]);
+}
+
+/* sendmmsg() of the collector code (linked with --wrap): the next call sends at most this many, 0 = all. */
+static unsigned sendmmsg_limit;
+
+// NOLINTBEGIN(bugprone-reserved-identifier,cert-dcl37-c,cert-dcl51-cpp,misc-use-internal-linkage)
+extern int __real_sendmmsg(int fd, struct mmsghdr *mm, unsigned n, int flags);
+int __wrap_sendmmsg(int fd, struct mmsghdr *mm, unsigned n, int flags);
+
+int __wrap_sendmmsg(int fd, struct mmsghdr *mm, unsigned n, int flags) {
+    const unsigned limit = sendmmsg_limit;
+
+    sendmmsg_limit = 0;
+    return __real_sendmmsg(fd, mm, limit && limit < n ? limit : n, flags);
+}
+// NOLINTEND(bugprone-reserved-identifier,cert-dcl37-c,cert-dcl51-cpp,misc-use-internal-linkage)
+
+static constexpr unsigned BATCH_N = 20;
+
+/* Messages "first", "first + 1", ... as a batch for collector_export_batch(). */
+static void make_batch(struct mmsghdr *mm, struct iovec *iov, char (*text)[4], unsigned n, unsigned first) {
+    for (unsigned i = 0; i < n; i++) {
+        iov[i].iov_len = (size_t)snprintf(text[i], sizeof(text[i]), "%u", first + i);
+        iov[i].iov_base = text[i];
+        mm[i].msg_hdr = (struct msghdr){.msg_iov = &iov[i], .msg_iovlen = 1};
+    }
+}
+
+/* Datagrams on rx must be @p want, in this order. */
+static void expect_strs(int rx, const char *const *want, int n) {
+    char buf[16];
+
+    for (int i = 0; i < n; i++) {
+        recv_str(rx, buf, sizeof(buf));
+        CHECK_STR(buf, want[i]);
+    }
+}
+
+/*
+ * A batch goes out as single messages would: the templates first when due, and after a refusal by
+ * a restarted collector, the templates and the refused message again, then the rest.
+ */
+static void test_collector_batch(void) {
+    static const char *const first[] = {"T", "0", "1", "2"};
+    static const char *const second[] = {"3", "4"};
+    static const char *const third[] = {"T", "6", "7", "8"};
+    struct collector c = {.name = "batch", .fd = -1, .templates_due = true};
+    struct mmsghdr mm[3];
+    struct iovec iov[3];
+    char text[3][4];
+    uint16_t port = 0;
+    char spec[32];
+    char err[256];
+    int rx = udp_listen(&port);
+
+    CHECK(rx >= 0);
+    if (rx < 0)
+        return;
+    (void)snprintf(spec, sizeof(spec), "127.0.0.1:%u", port);
+    c.fd = collector_open(spec, err, sizeof(err));
+    CHECK(c.fd >= 0);
+    if (c.fd < 0) {
+        (void)close(rx);
+        return;
+    }
+    make_batch(mm, iov, text, 3, 0);
+    collector_export_batch(&c, mm, 3, test_templates, nullptr);
+    expect_strs(rx, first, 4);
+    make_batch(mm, iov, text, 2, 3);
+    collector_export_batch(&c, mm, 2, test_templates, nullptr);
+    expect_strs(rx, second, 2);
+    (void)close(rx); // the collector restarts
+    make_batch(mm, iov, text, 1, 5);
+    collector_export_batch(&c, mm, 1, test_templates, nullptr); // the kernel answers port unreachable
+    (void)usleep(20000);                                        // the error is now pending on fd
+    rx = udp_listen(&port);
+    CHECK(rx >= 0);
+    if (rx >= 0) {
+        make_batch(mm, iov, text, 3, 6);
+        collector_export_batch(&c, mm, 3, test_templates, nullptr);
+        expect_strs(rx, third, 4);
+        (void)close(rx);
+    }
+    CHECK(!c.refused);
+    CHECK_EQ(c.sent, 9);
+    CHECK_EQ(c.errors, 0);
+    (void)close(c.fd);
+}
+
+static char drained[64][8];             ///< messages the collector received, "fill" left out
+static volatile sig_atomic_t n_drained; ///< entries in drained
+static int drain_fd = -1;               ///< the collector's end of the socket pair
+
+/* SIGALRM: the collector catches up while the sender waits in poll(), which then sees EINTR. */
+static void drain_all([[maybe_unused]] int sig) {
+    const int saved = errno;
+    ssize_t n = 0;
+
+    while (n_drained < 64 && (n = recv(drain_fd, drained[n_drained], sizeof(drained[0]) - 1, MSG_DONTWAIT)) > 0) {
+        drained[n_drained][n] = '\0';
+        if (n != 4) // "fill" is overwritten by the next one
+            n_drained++;
+    }
+    errno = saved;
+}
+
+/*
+ * A batch into a full send buffer: the first call sends 3 messages (a timer that already drained the
+ * buffer cannot make all fit), the templates go first again, then every message arrives, once and
+ * in order. No second process: the timer drains the buffer while the sender waits.
+ */
+static void test_collector_batch_full_buffer(void) {
+    struct sigaction sa = {.sa_handler = drain_all}; // no SA_RESTART: poll() returns
+    struct itimerval every_20ms = {.it_interval = {.tv_usec = 20000}, .it_value = {.tv_usec = 20000}};
+    const struct itimerval off = {};
+    struct collector c = {.name = "slow", .fd = -1};
+    struct mmsghdr mm[BATCH_N];
+    struct iovec iov[BATCH_N];
+    char text[BATCH_N][4];
+    char buf[8];
+    int sv[2] = {-1, -1};
+    unsigned long next = 0;
+    int templates = 0;
+
+    CHECK_EQ(socketpair(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, sv), 0);
+    if (sv[0] < 0)
+        return;
+    c.fd = sv[0];
+    drain_fd = sv[1];
+    n_drained = 0;
+    while (send(sv[0], "fill", 4, MSG_DONTWAIT) == 4)
+        ;
+    for (int i = 0; i < 3; i++) // room for 3 messages
+        CHECK_EQ(recv(sv[1], buf, sizeof(buf), MSG_DONTWAIT), 4);
+    CHECK_EQ(sigaction(SIGALRM, &sa, nullptr), 0);
+    CHECK_EQ(setitimer(ITIMER_REAL, &every_20ms, nullptr), 0);
+    c.wait_until_ns = clock_ns(CLOCK_MONOTONIC) + (2 * NSEC_PER_SEC);
+    make_batch(mm, iov, text, BATCH_N, 0);
+    sendmmsg_limit = 3;
+    collector_export_batch(&c, mm, BATCH_N, test_templates, nullptr);
+    (void)setitimer(ITIMER_REAL, &off, nullptr);
+    (void)signal(SIGALRM, SIG_DFL);
+    drain_all(0);
+    CHECK_EQ(c.sent, BATCH_N);
+    CHECK_EQ(c.errors, 0);
+    for (int i = 0; i < n_drained; i++) {
+        if (!strcmp(drained[i], "T"))
+            templates++;
+        else
+            CHECK_EQ(strtoul(drained[i], nullptr, 10), next++);
+    }
+    CHECK_EQ(next, BATCH_N);
+    CHECK(templates >= 1);
+    CHECK(strcmp(drained[0], "T") != 0); // after the messages that fitted
+    (void)close(sv[0]);
+    (void)close(sv[1]);
+}
+
+/* collector_templates_fn: the template messages of the exporter ctx. */
+static size_t ipfix_templates(void *ctx, unsigned index, uint8_t *buf, size_t len) {
+    return ipfix_template_message(ctx, index, 0, buf, len);
+}
+
+/*
+ * Datagrams on rx: the captured messages first .. first + n - 1, unchanged and in order, and in
+ * between template messages with the sequence number of the message after them. Returns those.
+ */
+static int expect_queued(int rx, int first, int n) {
+    struct pollfd pfd = {.fd = rx, .events = POLLIN};
+    uint8_t m[IPFIX_MSG_MAX];
+    ssize_t len = 0;
+    int templates = 0;
+    int next = first;
+
+    while (next < first + n && poll(&pfd, 1, 1000) == 1 && (len = recv(rx, m, sizeof(m), MSG_DONTWAIT)) > 0) {
+        if ((size_t)len == msg_len[next] && memcmp(m, msgs[next], (size_t)len) == 0) {
+            next++;
+            continue;
+        }
+        CHECK_EQ(get16(m + IPFIX_HDR_LEN), IPFIX_SET_TEMPLATE);
+        CHECK_EQ(get32(m + IPFIX_HDR_SEQ), get32(msgs[next] + IPFIX_HDR_SEQ));
+        templates++;
+    }
+    CHECK_EQ(next, first + n);
+    return templates;
+}
+
+/*
+ * Templates sent to recover a collector precede a queued message, encoded before the encoder
+ * counted the later ones: they carry its sequence number. Both template layouts; at the start,
+ * after a short batch and after a refusal; a second collector gets the queue unchanged.
+ */
+static void test_collector_template_seq(void) {
+    const struct flow_key key = make_key(4, 17, 1, 2);
+    const struct ipfix_record rec = {.key = &key, .packets = 1, .bytes = 100};
+    const size_t limits[] = {IPFIX_MSG_MAX, IPFIX_MSG_MIN};
+    const int records[] = {100, 40};
+
+    for (int l = 0; l < 2; l++) {
+        struct collector c[2] = {{.name = "due", .fd = -1, .templates_due = true}, {.name = "fine", .fd = -1}};
+        struct ipfix_exporter x;
+        struct mmsghdr mm[MAX_MSGS];
+        struct iovec iov[MAX_MSGS];
+        uint16_t port[2] = {};
+        int rx[2] = {-1, -1};
+        char spec[32];
+        char err[256];
+        unsigned n = 0;
+
+        ipfix_init(&x, 7, TPL_REFRESH_NS, 0, capture, nullptr);
+        ipfix_set_max_len(&x, limits[l]);
+        n_msgs = 0;
+        for (int i = 0; i < records[l]; i++)
+            ipfix_add(&x, &rec, 0, 1); // export time 1: recovery templates (0) differ from queued ones
+        ipfix_flush(&x, 1);
+        CHECK(n_msgs >= 5 && n_msgs <= MAX_MSGS);
+        n = (unsigned)n_msgs;
+        for (unsigned i = 0; i < n; i++) {
+            iov[i] = (struct iovec){.iov_base = msgs[i], .iov_len = msg_len[i]};
+            mm[i].msg_hdr = (struct msghdr){.msg_iov = &iov[i], .msg_iovlen = 1};
+        }
+        for (int j = 0; j < 2; j++) {
+            rx[j] = udp_listen(&port[j]);
+            (void)snprintf(spec, sizeof(spec), "127.0.0.1:%u", port[j]);
+            c[j].fd = collector_open(spec, err, sizeof(err));
+            CHECK(rx[j] >= 0 && c[j].fd >= 0);
+        }
+        sendmmsg_limit = 2; // due: templates, message 0, then a short batch
+        collector_export_batch(&c[0], mm, n, ipfix_templates, &x);
+        collector_export_batch(&c[1], mm, n, ipfix_templates, &x);
+        CHECK(expect_queued(rx[0], 0, (int)n) >= 2);
+        CHECK_EQ(expect_queued(rx[1], 0, (int)n), 0);
+        (void)close(rx[0]); // the collector restarts
+        collector_export_batch(&c[0], mm, 1, ipfix_templates, &x);
+        (void)usleep(20000); // the refusal is now pending
+        rx[0] = udp_listen(&port[0]);
+        CHECK(rx[0] >= 0);
+        collector_export_batch(&c[0], mm + 1, n - 1, ipfix_templates, &x);
+        CHECK(expect_queued(rx[0], 1, (int)n - 1) >= 1);
+        CHECK_EQ(c[0].errors, 0);
+        for (int j = 0; j < 2; j++) {
+            (void)close(rx[j]);
+            (void)close(c[j].fd);
+        }
+    }
+}
+
+/* The path MTU of a connected collector socket is known, less the IPv4 or IPv6 and UDP headers. */
+static void test_collector_max_message(void) {
+    const char *const specs[] = {"127.0.0.1:9", "[::1]:9"};
+    const size_t hdrs[] = {28, 48};
+    char err[256];
+
+    for (int i = 0; i < 2; i++) {
+        struct collector c = {.fd = collector_open(specs[i], err, sizeof(err))};
+        int mtu = 0;
+        socklen_t mtulen = sizeof(mtu);
+
+        if (c.fd < 0) {
+            CHECK(i == 1); // a kernel without IPv6
+            continue;
+        }
+        CHECK(collector_max_message(&c) > IPFIX_MSG_MAX); // loopback: about 64 KiB
+        CHECK_EQ(c.family, i ? AF_INET6 : AF_INET);       // looked up once
+        CHECK_EQ(getsockopt(c.fd, i ? IPPROTO_IPV6 : IPPROTO_IP, i ? IPV6_MTU : IP_MTU, &mtu, &mtulen), 0);
+        CHECK_EQ(collector_max_message(&c), (size_t)mtu - hdrs[i]);
+        (void)close(c.fd);
+    }
 }
 
 /* One owner per control socket; a stale socket is replaced, anything else is left alone. */
@@ -450,7 +776,6 @@ static void test_control_lock(void) {
     CHECK_EQ(rmdir(dir), 0);
 }
 
-/* /proc/net/vlan/config: VLAN ID and lower interface by name; header lines are skipped. */
 /* A Unix socket listening at path, as another program would have it: no lock file. */
 static int unix_listen(const char *path) {
     struct sockaddr_un sa = {.sun_family = AF_UNIX};
@@ -510,7 +835,7 @@ static void test_control_foreign_socket(void) {
         int status = 0;
 
         (void)wait(&status);
-        CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0); // empty reply: ENODATA
+        CHECK_EQ(WIFEXITED(status) ? WEXITSTATUS(status) : -1, 0); // empty reply: ENODATA
     }
     (void)close(other);
     if (out)
@@ -520,6 +845,73 @@ static void test_control_foreign_socket(void) {
     CHECK_EQ(rmdir(dir), 0);
 }
 
+/* A client connected to sa, or -1. */
+static int unix_connect(const struct sockaddr_un *sa) {
+    const int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+
+    if (fd >= 0 && connect(fd, (const struct sockaddr *)sa, sizeof(*sa))) {
+        (void)close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/* The command arrives; a silent client costs the daemon 200 ms at most; a reply never blocks. */
+static void test_control_accept(void) {
+    char dir[] = "/tmp/tcxflow-test.XXXXXX";
+    char sock[64];
+    char lock[72];
+    char cmd[64];
+    struct sockaddr_un sa = {.sun_family = AF_UNIX};
+    uint64_t start = 0;
+    int lock_fd = -1;
+    int lfd = -1;
+    int cl = -1;
+    int fd = -1;
+
+    CHECK(mkdtemp(dir) != nullptr);
+    (void)snprintf(sock, sizeof(sock), "%s/sock", dir);
+    (void)snprintf(lock, sizeof(lock), "%s.lock", sock);
+    (void)snprintf(sa.sun_path, sizeof(sa.sun_path), "%s", sock);
+    lfd = control_listen(sock, &lock_fd);
+    CHECK(lfd >= 0);
+    if (lfd < 0)
+        return;
+    cl = unix_connect(&sa);
+    CHECK(cl >= 0 && write(cl, "stats\n", 6) == 6);
+    fd = control_accept(lfd, cmd, sizeof(cmd));
+    CHECK(fd >= 0);
+    CHECK_STR(cmd, "stats");
+    if (fd >= 0) { // the client does not read: the reply is cut off
+        char buf[4096] = {};
+
+        CHECK(fcntl(fd, F_GETFL) & O_NONBLOCK);
+        while (write(fd, buf, sizeof(buf)) > 0)
+            ;
+        CHECK_EQ(errno, EAGAIN);
+        (void)close(fd);
+    }
+    if (cl >= 0)
+        (void)close(cl);
+    cl = unix_connect(&sa);
+    CHECK(cl >= 0);
+    start = clock_ns(CLOCK_MONOTONIC);
+    fd = control_accept(lfd, cmd, sizeof(cmd));
+    CHECK(fd >= 0);
+    CHECK_STR(cmd, "");
+    CHECK(clock_ns(CLOCK_MONOTONIC) - start < NSEC_PER_SEC);
+    if (fd >= 0)
+        (void)close(fd);
+    if (cl >= 0)
+        (void)close(cl);
+    (void)close(lfd);
+    (void)close(lock_fd);
+    (void)unlink(sock);
+    (void)unlink(lock);
+    CHECK_EQ(rmdir(dir), 0);
+}
+
+/* /proc/net/vlan/config: VLAN ID and lower interface by name; header lines are skipped. */
 static void test_vlan_parse(void) {
     static const char listing[] = "VLAN Dev name\t | VLAN ID\n"
                                   "Name-Type: VLAN_NAME_TYPE_RAW_PLUS_VID_NO_PAD\n"
@@ -569,7 +961,7 @@ static void test_ipfix_message_layout(void) {
     size_t data = 0;
 
     n_msgs = 0;
-    ipfix_init(&x, 42, TPL_REFRESH_NS, capture, nullptr);
+    ipfix_init(&x, 42, TPL_REFRESH_NS, 0, capture, nullptr);
     ipfix_add(&x, &rec, 1000, 1760000005);
     CHECK_EQ(n_msgs, 0); // nothing is sent before the flush
     ipfix_flush(&x, 1760000005);
@@ -637,7 +1029,7 @@ static void test_ipfix_vlan_ingress(void) {
 
     key.dir = FLOW_DIR_IN;
     n_msgs = 0;
-    ipfix_init(&x, 1, TPL_REFRESH_NS, capture, nullptr);
+    ipfix_init(&x, 1, TPL_REFRESH_NS, 0, capture, nullptr);
     ipfix_add(&x, &rec, 0, 0);
     ipfix_flush(&x, 0);
     data = find_set(0, IPFIX_TPL_V4);
@@ -659,7 +1051,7 @@ static void test_ipfix_icmp_and_ipv6(void) {
     size_t off = 0;
 
     n_msgs = 0;
-    ipfix_init(&x, 0, TPL_REFRESH_NS, capture, nullptr);
+    ipfix_init(&x, 0, TPL_REFRESH_NS, 0, capture, nullptr);
     ipfix_add(&x, &rec, 0, 1);
     rec.key = &v6;
     ipfix_add(&x, &rec, 0, 1);
@@ -694,7 +1086,7 @@ static void test_ipfix_max_len(void) {
     const struct flow_key key = make_key(4, 17, 1, 2);
     const struct ipfix_record rec = {.key = &key, .packets = 1, .bytes = 100};
 
-    ipfix_init(&x, 1, TPL_REFRESH_NS, capture, nullptr);
+    ipfix_init(&x, 1, TPL_REFRESH_NS, 0, capture, nullptr);
     n_msgs = 0;
     ipfix_set_max_len(&x, 300);
     for (int i = 0; i < 30; i++)
@@ -718,7 +1110,7 @@ static void test_ipfix_split_and_sequence(void) {
     uint32_t records = 0;
 
     n_msgs = 0;
-    ipfix_init(&x, 0, TPL_REFRESH_NS, capture, nullptr);
+    ipfix_init(&x, 0, TPL_REFRESH_NS, 0, capture, nullptr);
     for (int i = 0; i < 50; i++)
         ipfix_add(&x, &rec, 0, 1);
     ipfix_flush(&x, 1);
@@ -741,7 +1133,7 @@ static void test_ipfix_template_refresh(void) {
     const struct ipfix_record rec = {.key = &key, .packets = 1, .bytes = 100};
 
     n_msgs = 0;
-    ipfix_init(&x, 0, TPL_REFRESH_NS, capture, nullptr);
+    ipfix_init(&x, 0, TPL_REFRESH_NS, 0, capture, nullptr);
     for (unsigned i = 0; i < IPFIX_TPL_REFRESH_MSGS + 1; i++) { // one record per message
         ipfix_add(&x, &rec, i * NSEC_PER_SEC, 1);
         ipfix_flush(&x, 1);
@@ -758,34 +1150,69 @@ static void test_ipfix_template_refresh(void) {
     CHECK(find_set(n_msgs - 1, IPFIX_SET_TEMPLATE) != 0);
 }
 
-/* No flow ends for a while: the templates are repeated on their own, the sequence number stays. */
+/*
+ * The templates keep their own deadline, shorter than export-interval here: on their own while no
+ * flow ends, after the data waiting, and with the data they started a message with.
+ */
 static void test_ipfix_refresh_idle(void) {
     struct ipfix_exporter x;
     const struct flow_key key = make_key(4, 17, 1, 2);
     const struct ipfix_record rec = {.key = &key, .packets = 1, .bytes = 100};
 
     n_msgs = 0;
-    ipfix_init(&x, 7, 30 * NSEC_PER_SEC, capture, nullptr); // template-refresh 30
+    ipfix_init(&x, 7, 30 * NSEC_PER_SEC, 60 * NSEC_PER_SEC, capture, nullptr); // template-refresh 30
     ipfix_add(&x, &rec, 10 * NSEC_PER_SEC, 1);
     ipfix_flush(&x, 1);
     CHECK_EQ(n_msgs, 1);
-    ipfix_refresh(&x, 39 * NSEC_PER_SEC, 2); // not due yet
-    ipfix_flush(&x, 2);
+    ipfix_tick(&x, 39 * NSEC_PER_SEC, 2); // not due yet
     CHECK_EQ(n_msgs, 1);
-    ipfix_refresh(&x, 40 * NSEC_PER_SEC, 3);
-    ipfix_flush(&x, 3);
+    ipfix_tick(&x, 40 * NSEC_PER_SEC, 3);
     CHECK_EQ(n_msgs, 2);
-    CHECK(find_set(1, IPFIX_SET_TEMPLATE) != 0);
     CHECK_EQ(get16(msgs[1] + 2), IPFIX_HDR_LEN + 4 + (2 * (4 + (20 * 4)))); // templates only
-    CHECK_EQ(get32(msgs[1] + 8), 1);         // the sequence number counts the one data record
-    ipfix_refresh(&x, 41 * NSEC_PER_SEC, 4); // just sent
-    ipfix_flush(&x, 4);
+    CHECK_EQ(get32(msgs[1] + 8), 1);      // the sequence number counts the one data record
+    ipfix_tick(&x, 41 * NSEC_PER_SEC, 4); // just sent
     CHECK_EQ(n_msgs, 2);
+    ipfix_add(&x, &rec, 50 * NSEC_PER_SEC, 5);
+    ipfix_tick(&x, 60 * NSEC_PER_SEC, 6); // the data waits for export-interval ...
+    CHECK_EQ(n_msgs, 2);
+    ipfix_tick(&x, 70 * NSEC_PER_SEC, 7); // ... the templates do not: the data goes first
+    CHECK_EQ(n_msgs, 4);
+    CHECK(find_set(2, IPFIX_TPL_V4) != 0 && find_set(2, IPFIX_SET_TEMPLATE) == 0);
+    CHECK(find_set(3, IPFIX_SET_TEMPLATE) != 0 && find_set(3, IPFIX_TPL_V4) == 0);
+    CHECK_EQ(get32(msgs[3] + 8), 2);
+    ipfix_add(&x, &rec, 101 * NSEC_PER_SEC, 8); // due again: one message with templates and data
+    ipfix_tick(&x, 101 * NSEC_PER_SEC, 8);
+    CHECK_EQ(n_msgs, 5);
+    CHECK(find_set(4, IPFIX_SET_TEMPLATE) != 0 && find_set(4, IPFIX_TPL_V4) != 0);
+    CHECK_EQ(get32(msgs[4] + 8), 2);
+    CHECK_EQ(x.n_records, 3);
+}
+
+/* A partly filled message is sent once it is export-interval old, also when ticks were skipped. */
+static void test_ipfix_tick_wait(void) {
+    struct ipfix_exporter x;
+    const struct flow_key key = make_key(4, 17, 1, 2);
+    const struct ipfix_record rec = {.key = &key, .packets = 1};
+
+    n_msgs = 0;
+    ipfix_init(&x, 1, 86400 * NSEC_PER_SEC, 10 * NSEC_PER_SEC, capture, nullptr);
+    ipfix_tick(&x, 0, 0); // the initial templates
+    CHECK_EQ(n_msgs, 1);
+    ipfix_add(&x, &rec, 1'200'000'000, 1); // in a tick that ran 200 ms late
+    for (uint64_t t = 1; t <= 10; t++)
+        ipfix_tick(&x, t * NSEC_PER_SEC, (uint32_t)t);
+    CHECK_EQ(n_msgs, 1);
+    ipfix_tick(&x, 11 * NSEC_PER_SEC, 11); // the 10th tick after it
+    CHECK_EQ(n_msgs, 2);
+    ipfix_add(&x, &rec, 12 * NSEC_PER_SEC, 12);
+    ipfix_tick(&x, 100 * NSEC_PER_SEC, 100); // ticks 13 to 99 skipped: the next one sends it
+    CHECK_EQ(n_msgs, 3);
+    CHECK_EQ(x.n_records, 2);
 }
 
 /*
  * A path MTU too small for the templates and a record: the templates go in messages of their
- * own, one per template below 188 bytes, and every message fits.
+ * own, one per template below 188 bytes, and every message fits. A full one is sent at once.
  */
 static void test_ipfix_small_pmtu(void) {
     struct ipfix_exporter x;
@@ -799,11 +1226,12 @@ static void test_ipfix_small_pmtu(void) {
         const int tpl_msgs = limits[l] >= IPFIX_HDR_LEN + 4 + (2 * (4 + (20 * 4))) ? 1 : 2;
 
         n_msgs = 0;
-        ipfix_init(&x, 1, TPL_REFRESH_NS, capture, nullptr);
+        ipfix_init(&x, 1, TPL_REFRESH_NS, 0, capture, nullptr);
         ipfix_set_max_len(&x, limits[l]);
         ipfix_add(&x, &r4, 0, 0);
+        CHECK_EQ(x.len != 0, limits[l] > IPFIX_MSG_MIN); // room for another IPv4 record?
         ipfix_add(&x, &r6, 0, 0);
-        ipfix_flush(&x, 0);
+        CHECK_EQ(x.len, 0); // no room left: sent without a flush
         CHECK(n_msgs >= tpl_msgs + 1);
         for (int i = 0; i < n_msgs && i < MAX_MSGS; i++) {
             CHECK(msg_len[i] <= limits[l]);
@@ -818,12 +1246,55 @@ static void test_ipfix_small_pmtu(void) {
     }
 }
 
+/*
+ * The path MTU shrinks while templates and mixed sets wait in a message: sent by a flush or by the
+ * next record, they arrive in messages that fit, templates first, every record once and in order.
+ */
+static void test_ipfix_shrunk_pmtu(void) {
+    struct ipfix_exporter x;
+    const struct flow_key k4 = make_key(4, 17, 1, 2);
+    const struct flow_key k6 = make_key(6, 17, 1, 2);
+
+    for (int by_add = 0; by_add < 2; by_add++) {
+        const uint64_t n = 12 + (uint64_t)by_add;
+        uint64_t next = 1;
+
+        n_msgs = 0;
+        ipfix_init(&x, 1, TPL_REFRESH_NS, 0, capture, nullptr);
+        for (uint64_t i = 1; i <= n; i++) {
+            const struct ipfix_record r = {.key = i % 3 ? &k4 : &k6, .packets = i}; // v4, v4, v6, ...
+
+            ipfix_add(&x, &r, 0, 0);
+            if (i == 12)
+                ipfix_set_max_len(&x, IPFIX_MSG_MIN);
+        }
+        CHECK_EQ(n_msgs != 0, by_add != 0); // the 13th record sent them
+        ipfix_flush(&x, 0);
+        CHECK(n_msgs > 1 && n_msgs < MAX_MSGS);
+        for (int m = 0; m < n_msgs && m < MAX_MSGS; m++) {
+            CHECK(msg_len[m] <= IPFIX_MSG_MIN);
+            CHECK_EQ(get16(msgs[m] + 2), msg_len[m]);
+            CHECK_EQ(get32(msgs[m] + 8), next - 1); // data records before
+            for (size_t off = IPFIX_HDR_LEN; off < msg_len[m]; off += get16(msgs[m] + off + 2)) {
+                const uint16_t id = get16(msgs[m] + off);
+                const size_t rlen = id == IPFIX_TPL_V4 ? IPFIX_REC_V4 : IPFIX_REC_V6;
+
+                CHECK(id != IPFIX_SET_TEMPLATE || next == 1);
+                for (size_t r = off + 4; id != IPFIX_SET_TEMPLATE && r < off + get16(msgs[m] + off + 2); r += rlen)
+                    CHECK_EQ(get64(msgs[m] + r + (id == IPFIX_TPL_V4 ? 35 : 59)), next++); // packets
+            }
+        }
+        CHECK_EQ(next, n + 1);
+        CHECK_EQ(x.n_records, n);
+    }
+}
+
 /* What a collector gets before the next message when it needs the templates. */
 static void test_ipfix_template_message(void) {
     struct ipfix_exporter x;
     uint8_t buf[512];
 
-    ipfix_init(&x, 9, TPL_REFRESH_NS, capture, nullptr);
+    ipfix_init(&x, 9, TPL_REFRESH_NS, 0, capture, nullptr);
     CHECK_EQ(ipfix_template_message(&x, 0, 5, buf, sizeof(buf)), IPFIX_HDR_LEN + 4 + (2 * 84));
     CHECK_EQ(get32(buf + 4), 5);  // export time
     CHECK_EQ(get32(buf + 12), 9); // observation domain
@@ -952,6 +1423,49 @@ static void test_cache_growth_and_reuse(void) {
         CHECK_EQ(cache_add(&c, &key, &val), 0);
     }
     CHECK_EQ(c.used, used);
+    cache_destroy(&c);
+}
+
+/* Chains hold their entries oldest first, so that evict() finds them at the front. */
+static void check_chains_by_age(const struct flow_cache *c) {
+    uint32_t n = 0;
+
+    for (uint32_t b = 0; b < c->n_buckets; b++) {
+        uint64_t last = 0;
+
+        for (uint32_t i = c->bucket[b]; i != CACHE_NIL; i = c->entries[i].next, n++) {
+            CHECK(c->entries[i].first_ns > last);
+            last = c->entries[i].first_ns;
+        }
+    }
+    CHECK_EQ(n, c->count); // nothing lost on the way
+}
+
+static void test_cache_chain_order(void) {
+    struct flow_cache c;
+    uint32_t count = 0;
+    uint64_t t = 0;
+
+    CHECK_EQ(cache_init(&c, 1, UINT32_MAX, &policy, count_only, &count), 0);
+    for (uint32_t i = 0; i < 5000; i++) { // grows the buckets from 1 to 8192
+        const struct flow_key key = make_key(4, 17, (uint16_t)i, 1);
+        const uint64_t now = ++t;
+        const struct flow_val val = {.first_ns = now, .last_ns = now};
+
+        CHECK_EQ(cache_add(&c, &key, &val), 0);
+    }
+    check_chains_by_age(&c);
+    t += policy.inactive_ns;
+    for (uint32_t i = 0; i < 5000; i += 3) { // a gap ends the flow: evicted, a new one appended
+        const struct flow_key key = make_key(4, 17, (uint16_t)i, 1);
+        const uint64_t now = ++t;
+        const struct flow_val val = {.first_ns = now, .last_ns = now};
+
+        CHECK_EQ(cache_add(&c, &key, &val), 0);
+    }
+    CHECK_EQ(count, 1667);
+    CHECK_EQ(c.count, 5000);
+    check_chains_by_age(&c);
     cache_destroy(&c);
 }
 
@@ -1208,32 +1722,110 @@ static void test_cache_memory(void) {
     cache_destroy(&c);
 }
 
+/* A cache whose initialisation failed is empty and usable: stop() still drains into it. */
+static void test_cache_init_failed(void) {
+    struct flow_cache c;
+    const struct flow_val val = {.first_ns = 1, .last_ns = 1, .packets = 1};
+    const struct flow_key k = make_key(4, 17, 1, 1);
+
+    for (int i = 0; i < 2; i++) {
+        CHECK_EQ(cache_init(&c, i ? UINT32_MAX : 0, 100000, &policy, collect, nullptr), (unsigned long long)-EINVAL);
+        CHECK_EQ(cache_add(&c, &k, &val), (unsigned long long)-ENOMEM);
+        CHECK_EQ(cache_expire(&c, 1, true), 0);
+        CHECK_EQ(cache_memory(&c), 0);
+        cache_destroy(&c);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Interfaces                                                         */
+
+/* Colliding slots are probed past, an ifindex is unique, the table is bounded. */
+static void test_iface_table(void) {
+    static struct iface_table t;
+    const struct iface_config cfg = {.name = "eth0", .dir = {true, false}};
+    struct flow_key k = {.dir = FLOW_DIR_IN, .in_if = 1};
+    struct iface_state *a = nullptr;
+    struct iface_state *b = nullptr;
+
+    CHECK_EQ(iface_add(&t, &cfg, 1, &a), 0);
+    CHECK_EQ(iface_add(&t, &cfg, 1 + IFACE_MAP_SIZE, &b), 0); // the same slot
+    CHECK(iface_of_flow(&t, &k) == a);
+    k.in_if = 1 + IFACE_MAP_SIZE;
+    CHECK(iface_of_flow(&t, &k) == b);
+    k = (struct flow_key){.dir = FLOW_DIR_OUT, .in_if = 1, .out_if = 2};
+    CHECK(iface_of_flow(&t, &k) == nullptr); // egress: the outgoing interface counts
+    CHECK_EQ(iface_add(&t, &cfg, 1, &b), (unsigned long long)-EEXIST);
+    CHECK(b == a);
+    for (unsigned i = 2; t.n < CONFIG_MAX_IFACES; i++)
+        CHECK_EQ(iface_add(&t, &cfg, 1000 + i, &b), 0);
+    CHECK_EQ(iface_add(&t, &cfg, 5000, &b), (unsigned long long)-ENOSPC);
+    CHECK_STR(iface_dir_name(&cfg), "in");
+}
+
+/* VLAN interface IDs first, then the tags in the packet; two levels at most. */
+static void test_iface_vlans(void) {
+    struct iface_state s = {.vlan = 100};
+    const struct flow_key k = {.vlan = 200, .vlan_inner = 300};
+    uint16_t outer = 0;
+    uint16_t inner = 0;
+    char buf[16];
+
+    iface_vlans(nullptr, &k, &outer, &inner); // not a metered interface: the tags only
+    CHECK(outer == 200 && inner == 300);
+    iface_vlans(&s, &k, &outer, &inner);
+    CHECK(outer == 100 && inner == 200);
+    iface_format_vlan(&s, buf, sizeof(buf));
+    CHECK_STR(buf, "100");
+    s.vlan_inner = 101; // QinQ interface
+    iface_vlans(&s, &k, &outer, &inner);
+    CHECK(outer == 100 && inner == 101);
+    iface_format_vlan(&s, buf, sizeof(buf));
+    CHECK_STR(buf, "100.101");
+    s = (struct iface_state){};
+    iface_vlans(&s, &(struct flow_key){}, &outer, &inner);
+    CHECK(outer == 0 && inner == 0);
+    iface_format_vlan(&s, buf, sizeof(buf));
+    CHECK_STR(buf, "-");
+}
+
 int main(void) {
     RUN_TEST(test_config_defaults);
     RUN_TEST(test_config_file);
     RUN_TEST(test_config_errors);
+    RUN_TEST(test_config_options);
     RUN_TEST(test_config_long_line);
     RUN_TEST(test_config_limits);
     RUN_TEST(test_config_validate);
     RUN_TEST(test_collector_split);
     RUN_TEST(test_collector_export_after_refused);
     RUN_TEST(test_collector_templates_after_failure);
+    RUN_TEST(test_collector_waits_for_full_buffer);
+    RUN_TEST(test_collector_batch);
+    RUN_TEST(test_collector_batch_full_buffer);
+    RUN_TEST(test_collector_template_seq);
     RUN_TEST(test_collector_max_message);
     RUN_TEST(test_control_lock);
     RUN_TEST(test_control_foreign_socket);
+    RUN_TEST(test_control_accept);
     RUN_TEST(test_vlan_parse);
+    RUN_TEST(test_iface_table);
+    RUN_TEST(test_iface_vlans);
     RUN_TEST(test_ipfix_message_layout);
     RUN_TEST(test_ipfix_icmp_and_ipv6);
     RUN_TEST(test_ipfix_vlan_ingress);
     RUN_TEST(test_ipfix_split_and_sequence);
     RUN_TEST(test_ipfix_template_refresh);
     RUN_TEST(test_ipfix_refresh_idle);
+    RUN_TEST(test_ipfix_tick_wait);
     RUN_TEST(test_ipfix_small_pmtu);
+    RUN_TEST(test_ipfix_shrunk_pmtu);
     RUN_TEST(test_ipfix_template_message);
     RUN_TEST(test_ipfix_max_len);
     RUN_TEST(test_cache_merge);
     RUN_TEST(test_cache_expire_reasons);
     RUN_TEST(test_cache_growth_and_reuse);
+    RUN_TEST(test_cache_chain_order);
     RUN_TEST(test_cache_limit);
     RUN_TEST(test_cache_matches_brute_force);
     RUN_TEST(test_cache_expiry_delay_bounded);
@@ -1242,5 +1834,6 @@ int main(void) {
     RUN_TEST(test_cache_older_interval_later);
     RUN_TEST(test_cache_delayed_interval);
     RUN_TEST(test_cache_memory);
+    RUN_TEST(test_cache_init_failed);
     return test_summary();
 }

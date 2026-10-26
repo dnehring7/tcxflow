@@ -27,7 +27,8 @@
 [[nodiscard]] int control_listen(const char *path, int *lock_fd);
 
 /**
- * Accept one pending client and read its command line, waiting 200 ms at most.
+ * Accept one pending client and read its command line, waiting 200 ms at most. The client
+ * descriptor is non-blocking.
  *
  * @param listen_fd  descriptor from control_listen()
  * @param cmd        receives the command, without the newline

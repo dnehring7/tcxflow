@@ -129,6 +129,7 @@ collector        127.0.0.1:$PORT1
 collector        127.0.0.1:$PORT2
 inactive-timeout 2
 active-timeout   2
+export-interval  0
 socket           $WORK/tcxflow.sock
 EOF
 mkdir "$WORK/c1" "$WORK/c2"
@@ -308,6 +309,7 @@ netns            $DP
 interface        tcol:out
 collector        127.0.0.1:$PORT3
 inactive-timeout 1
+export-interval  0
 socket           $WORK/restart.sock
 EOF
 datagram() { nsx "$DP" bash -c "printf x >/dev/udp/10.77.0.99/$1"; } # 29 bytes
@@ -344,6 +346,53 @@ else
     cat "$WORK/tcxflow-restart.log"
 fi
 
+# --- export-interval: a partly filled message waits, the final export still sends it ---------
+sed -e "s|restart.sock|batch.sock|" -e "s|^export-interval.*|export-interval  60|" "$WORK/restart.conf" >"$WORK/batch.conf"
+mkdir "$WORK/batch"
+ip netns exec "$MGMT" nfcapd -b 127.0.0.1 -p "$PORT3" -w "$WORK/batch" >/dev/null 2>&1 &
+COLL=$!
+PIDS+=("$COLL")
+sleep 1
+"${TCX[@]}" --config "$WORK/batch.conf" >"$WORK/tcxflow-batch.log" 2>&1 &
+DAEMON=$!
+PIDS+=("$DAEMON")
+wait_started $DAEMON "$WORK/tcxflow-batch.log"
+sleep 2 # the initial templates are sent, they do not wait
+datagram 65004
+sleep 3 # the flow ended (inactive-timeout 1), its record waits in the open message
+BATCHED=$("${TCX[@]}" --config "$WORK/batch.conf" stats | grep -c '^flows exported *0$' || true)
+kill -TERM $DAEMON
+wait $DAEMON || true
+kill -TERM $COLL
+wait $COLL || true
+GOT=$(nfdump -R "$WORK/batch" -N -q -o 'fmt:%pkt %byt' 'proto udp and dst port 65004' | awk '{p += $1; b += $2} END {print p + 0, b + 0}')
+if [[ $BATCHED == 1 && $GOT == "1 29" ]]; then
+    ok "export-interval: record held back, sent by the final export"
+else
+    fail "export-interval: held back $BATCHED (expected 1), got \"$GOT\" (expected 1 29)"
+    cat "$WORK/tcxflow-batch.log"
+fi
+
+# --- more new flows in a second than max-flows: the packets not accounted are reported --------
+sed -e "s|restart.sock|full.sock|" "$WORK/restart.conf" >"$WORK/full.conf"
+echo "max-flows        1024" >>"$WORK/full.conf"
+"${TCX[@]}" --config "$WORK/full.conf" >"$WORK/tcxflow-full.log" 2>&1 &
+DAEMON=$!
+PIDS+=("$DAEMON")
+wait_started $DAEMON "$WORK/tcxflow-full.log"
+# Over one tick boundary at most: one of the two intervals gets more than 1024 flows.
+# shellcheck disable=SC2016 # expanded by the inner bash
+nsx "$DP" bash -c 'for p in {1..3000}; do printf x >/dev/udp/10.77.0.99/$p; done'
+sleep 2
+kill -TERM $DAEMON
+wait $DAEMON || true
+if grep -q 'WARNING: flow table full, [0-9]* packets not accounted' "$WORK/tcxflow-full.log"; then
+    ok "max-flows exceeded: lost packets reported"
+else
+    fail "max-flows exceeded: no warning"
+    cat "$WORK/tcxflow-full.log"
+fi
+
 # --- an interface replaced by one with the same name and index: the kernel detached tcxflow's
 # links from the old one, so nothing is metered any more; tcxflow must notice and exit ------
 nsx "$DP" ip link add trep type veth peer name trep-peer
@@ -362,6 +411,29 @@ wait_started $DAEMON "$WORK/tcxflow-replace.log"
 # the index unchanged.
 printf 'link del trep\nlink add trep index %s type veth peer name trep-peer\n' "$REP" | nsx "$DP" ip -batch -
 expect_exit $DAEMON "$WORK/tcxflow-replace.log" "interface trep is gone" "interface replaced (index $REP)"
+
+# --- one direction detached on its own: it is no longer metered, tcxflow must notice and exit ---
+for dir in ingress egress; do
+    if ! command -v bpftool >/dev/null; then
+        printf 'skip  %s link detached (no bpftool)\n' "$dir"
+        continue
+    fi
+    "${TCX[@]}" --config "$WORK/replace.conf" >"$WORK/tcxflow-detach.log" 2>&1 &
+    DAEMON=$!
+    PIDS+=("$DAEMON")
+    wait_started $DAEMON "$WORK/tcxflow-detach.log"
+    LINK=$(awk -v dir="($dir)" '/^link_id:/ {id = $2} /^attach_type:/ && index($0, dir) {print id}' /proc/"$DAEMON"/fdinfo/*)
+    bpftool link detach id "${LINK:-0}" || fail "$dir link not found"
+    expect_exit $DAEMON "$WORK/tcxflow-detach.log" "interface trep is gone or detached" "$dir link detached"
+done
+
+# --- an interface given twice, by name and by altname: refused at start ------------------
+nsx "$DP" ip link property add dev trep altname trep-alt
+"${TCX[@]}" --netns "$DP" -i trep:in -i trep-alt:out --collector "127.0.0.1:$PORT1" --socket "$WORK/alt.sock" \
+    >"$WORK/tcxflow-alt.log" 2>&1 &
+DAEMON=$!
+PIDS+=("$DAEMON")
+expect_exit $DAEMON "$WORK/tcxflow-alt.log" "interface trep-alt is the same as trep" "interface and its altname"
 
 # --- the namespace is deleted: tcxflow must let go of it and exit with status 1 -----------
 "${TCX[@]}" --config "$WORK/tcxflow.conf" >"$WORK/tcxflow-netns.log" 2>&1 &

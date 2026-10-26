@@ -10,22 +10,26 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/socket.h> // struct mmsghdr
 
 #define COLLECTOR_DEFAULT_PORT "4739" ///< IANA port for IPFIX, used when an address has none
 
 /** A collector: its socket and the state of the message stream to it. */
 struct collector {
-    const char *name;   /**< address as configured, for log messages */
-    int fd;             /**< connected UDP socket from collector_open(), -1 = none */
-    uint64_t sent;      /**< messages sent */
-    uint64_t errors;    /**< messages that could not be sent */
-    uint64_t failing;   /**< messages not sent since the last one that was */
-    bool refused;       /**< the last message was refused: the collector is down or restarting */
-    bool templates_due; /**< send the templates before the next message */
+    const char *name;       /**< address as configured, for log messages */
+    int fd;                 /**< connected UDP socket from collector_open(), -1 = none */
+    int family;             /**< address family of fd, 0 = not looked up yet */
+    uint64_t sent;          /**< messages sent */
+    uint64_t errors;        /**< messages that could not be sent */
+    uint64_t failing;       /**< messages not sent since the last one that was */
+    uint64_t wait_until_ns; /**< wait for room in a full send buffer until then (CLOCK_MONOTONIC), 0 = never */
+    bool refused;           /**< the last message was refused: the collector is down or restarting */
+    bool templates_due;     /**< send the templates before the next message */
 };
 
 /**
- * Writes the index-th message with just the templates into @p buf (ipfix_template_message()).
+ * Writes the index-th message with just the templates into @p buf (ipfix_template_message()). The
+ * collector gives it the sequence number of the message it precedes.
  *
  * @return message length, 0 after the last message
  */
@@ -56,13 +60,13 @@ typedef size_t (*collector_templates_fn)(void *ctx, unsigned index, uint8_t *buf
 [[nodiscard]] int collector_open(const char *spec, char *err, size_t errlen);
 
 /**
- * Largest IPFIX message that fits the path MTU of a socket from collector_open() without
- * fragmentation (the route MTU, lowered by what path MTU discovery has learned).
+ * Largest IPFIX message that fits the path MTU of a collector's socket without fragmentation
+ * (the route MTU, lowered by what path MTU discovery has learned).
  *
- * @param fd  collector socket
+ * @param c  collector, its family is looked up on the first call
  * @return message size in bytes, 0 if unknown
  */
-[[nodiscard]] size_t collector_max_message(int fd);
+[[nodiscard]] size_t collector_max_message(struct collector *c);
 
 /**
  * Send one message to a collector, with the templates first where it needs them.
@@ -72,7 +76,8 @@ typedef size_t (*collector_templates_fn)(void *ctx, unsigned index, uint8_t *buf
  * error: the templates, which a restarted collector no longer knows, go out, then the message
  * once more. A message that could not be sent may have carried the templates: they precede the
  * next one. Only this collector gets them, the others are not affected. The first failure and
- * the recovery are logged, not every message.
+ * the recovery are logged, not every message. A full send buffer is waited for until
+ * c->wait_until_ns.
  *
  * @param c          collector
  * @param msg        message
@@ -83,5 +88,18 @@ typedef size_t (*collector_templates_fn)(void *ctx, unsigned index, uint8_t *buf
  */
 [[nodiscard]] int collector_export(struct collector *c, const void *msg, size_t len, collector_templates_fn templates,
                                    void *ctx);
+
+/**
+ * Send messages to a collector as collector_export() does, but all in one sendmmsg() call while
+ * the collector takes them: one syscall instead of one per message.
+ *
+ * @param c          collector
+ * @param msgs       messages, one iovec each; msg_len is overwritten
+ * @param n          number of messages
+ * @param templates  writes the template messages
+ * @param ctx        passed to @p templates
+ */
+void collector_export_batch(struct collector *c, struct mmsghdr *msgs, unsigned n, collector_templates_fn templates,
+                            void *ctx);
 
 #endif // TCXFLOW_COLLECTOR_H

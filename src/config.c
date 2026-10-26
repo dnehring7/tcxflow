@@ -19,6 +19,12 @@
 
 static constexpr size_t LINE_MAX_LEN = 512; ///< longest configuration file line, including the newline
 
+const char *const config_options[CONFIG_N_OPTIONS] = {
+    "interface",        "collector",       "netns",       "inactive-timeout",
+    "active-timeout",   "max-flows",       "cache-flows", "observation-domain",
+    "template-refresh", "export-interval", "socket",
+};
+
 static int set_number(const char *key, const char *value, unsigned long min, unsigned long max, uint32_t *out,
                       char *err, size_t errlen) {
     char *end = nullptr;
@@ -98,6 +104,7 @@ static int add_collector(struct config *cfg, const char *value, char *err, size_
 void config_init(struct config *cfg) {
     memset(cfg, 0, sizeof(*cfg));
     cfg->template_refresh = 60;
+    cfg->export_interval = 10;
     cfg->inactive_timeout = 15;
     cfg->active_timeout = 1800;
     cfg->max_flows = 131072;
@@ -112,6 +119,15 @@ void config_init(struct config *cfg) {
  * here, so they cannot drift apart and every check exists only once.
  */
 int config_set(struct config *cfg, const char *key, const char *value, char *err, size_t errlen) {
+    bool known = false;
+
+    // An option missing from config_options would work in the file but not on the command line.
+    for (int i = 0; i < CONFIG_N_OPTIONS && !known; i++)
+        known = !strcmp(key, config_options[i]);
+    if (!known) {
+        (void)snprintf(err, errlen, "unknown option \"%s\"", key);
+        return -1;
+    }
     if (!strcmp(key, "interface"))
         return add_interface(cfg, value, err, errlen);
     if (!strcmp(key, "collector"))
@@ -126,6 +142,8 @@ int config_set(struct config *cfg, const char *key, const char *value, char *err
         return set_number(key, value, 1024, 1UL << 27, &cfg->cache_flows, err, errlen);
     if (!strcmp(key, "template-refresh"))
         return set_number(key, value, 1, 86400, &cfg->template_refresh, err, errlen);
+    if (!strcmp(key, "export-interval"))
+        return set_number(key, value, 0, 60, &cfg->export_interval, err, errlen);
     if (!strcmp(key, "observation-domain"))
         return set_number(key, value, 0, UINT32_MAX, &cfg->observation_domain, err, errlen);
     if (!strcmp(key, "netns")) {
@@ -142,7 +160,7 @@ int config_set(struct config *cfg, const char *key, const char *value, char *err
         }
         return set_string(key, value, cfg->socket, sizeof(cfg->socket), err, errlen);
     }
-    (void)snprintf(err, errlen, "unknown option \"%s\"", key);
+    (void)snprintf(err, errlen, "option \"%s\" is not implemented", key);
     return -1;
 }
 

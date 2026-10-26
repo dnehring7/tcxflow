@@ -87,8 +87,10 @@ jobs:
         run: |
           git config --global --add safe.directory '*'
           git archive --format=tar.gz --prefix="tcxflow-${V}/" HEAD -o "tcxflow-${V}.tar.gz"
-          # debug_package=%{nil} suppresses the auto -debuginfo / -debugsource subpackages.
-          rpmbuild -ta --define 'debug_package %{nil}' "tcxflow-${V}.tar.gz"
+          # find-debuginfo strips the binary (debug_package %{nil} would leave its symbol table); its
+          # -debuginfo / -debugsource packages are not published, as the .deb has no -dbgsym.
+          rpmbuild -ta "tcxflow-${V}.tar.gz"
+          rm "${HOME}"/rpmbuild/RPMS/x86_64/tcxflow-debug*.rpm
           rpm --addsign "${HOME}"/rpmbuild/RPMS/x86_64/*.rpm "${HOME}"/rpmbuild/SRPMS/*.rpm
           # Repo layout matches the URL the .repo file will hand to dnf:
           #   <pages>/almalinux/<rel>/x86_64/{*.rpm, repodata/}
@@ -106,13 +108,14 @@ jobs:
         env:
           KEYFP: ${{ steps.gpg.outputs.fingerprint }}
         run: |
-          # Signed, installable, and at the version of the tag.
+          # Signed, installable, at the version of the tag, and stripped.
           gpg --batch --armor --export "${KEYFP}" > /tmp/key.asc
           rpm --import /tmp/key.asc
           for f in pkgs/*.rpm; do rpm -K "$f" | grep -q 'digests signatures OK' || { rpm -K "$f"; exit 1; }; done
           dnf install -y repo/"${EL_REL}"/x86_64/tcxflow-*.rpm
           tcxflow --version | grep -qx "tcxflow ${TAG}"
           tcxflow check
+          readelf -SW /usr/sbin/tcxflow | awk '/\.symtab/ {print "::error::tcxflow is not stripped"; s = 1} END {exit s}'
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
@@ -165,10 +168,11 @@ jobs:
 
       - name: Test the package
         run: |
-          # Installable and at the version of the tag.
+          # Installable, at the version of the tag, and stripped.
           apt-get install -y ./_out/tcxflow_*.deb
           tcxflow --version | grep -qx "tcxflow ${TAG}"
           tcxflow check
+          readelf -SW /usr/sbin/tcxflow | awk '/\.symtab/ {print "::error::tcxflow is not stripped"; s = 1} END {exit s}'
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
