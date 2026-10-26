@@ -127,13 +127,14 @@ int control_listen(const char *path, int *lock_fd) {
 }
 
 int control_accept(int listen_fd, char *cmd, size_t cmdlen) {
-    const int fd = accept4(listen_fd, nullptr, nullptr, SOCK_CLOEXEC);
+    // Non-blocking: poll() bounds the read, and a client that stops reading gets a cut-off reply
+    // instead of stalling the exporter (a reply is a few KiB and normally fits the socket buffer).
+    const int fd = accept4(listen_fd, nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK);
     const uint64_t deadline = clock_ns(CLOCK_MONOTONIC) + (CMD_TIMEOUT_MS * NSEC_PER_MSEC);
     size_t len = 0;
 
     if (fd < 0)
         return -1;
-    set_timeouts(fd);
     // One deadline for the whole command: a slow client must not hold up the exporter.
     while (len + 1 < cmdlen && !memchr(cmd, '\n', len)) {
         const uint64_t now = clock_ns(CLOCK_MONOTONIC);
@@ -149,9 +150,6 @@ int control_accept(int listen_fd, char *cmd, size_t cmdlen) {
     }
     cmd[len] = '\0';
     cmd[strcspn(cmd, "\r\n")] = '\0';
-    // Replies are written non-blocking: a client that stops reading gets a cut-off reply, it
-    // cannot stall the exporter (a reply is a few KiB and normally fits the socket buffer).
-    (void)fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
     return fd;
 }
 

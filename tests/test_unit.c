@@ -9,6 +9,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h> // IWYU pragma: keep (ENOSPC)
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -289,7 +290,6 @@ static int udp_listen(uint16_t *port) {
     return fd;
 }
 
-/* A collector that was down (ICMP port unreachable) and is back must get the next message. */
 /* collector_templates_fn: one template message, "T", for the tests. */
 static size_t test_templates([[maybe_unused]] void *ctx, unsigned index, uint8_t *buf, size_t len) {
     if (index > 0 || len < 1)
@@ -493,7 +493,6 @@ static void test_control_lock(void) {
     CHECK_EQ(rmdir(dir), 0);
 }
 
-/* /proc/net/vlan/config: VLAN ID and lower interface by name; header lines are skipped. */
 /* A Unix socket listening at path, as another program would have it: no lock file. */
 static int unix_listen(const char *path) {
     struct sockaddr_un sa = {.sun_family = AF_UNIX};
@@ -563,6 +562,73 @@ static void test_control_foreign_socket(void) {
     CHECK_EQ(rmdir(dir), 0);
 }
 
+/* A client connected to sa, or -1. */
+static int unix_connect(const struct sockaddr_un *sa) {
+    const int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+
+    if (fd >= 0 && connect(fd, (const struct sockaddr *)sa, sizeof(*sa))) {
+        (void)close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/* The command arrives; a silent client costs the daemon 200 ms at most; a reply never blocks. */
+static void test_control_accept(void) {
+    char dir[] = "/tmp/tcxflow-test.XXXXXX";
+    char sock[64];
+    char lock[72];
+    char cmd[64];
+    struct sockaddr_un sa = {.sun_family = AF_UNIX};
+    uint64_t start = 0;
+    int lock_fd = -1;
+    int lfd = -1;
+    int cl = -1;
+    int fd = -1;
+
+    CHECK(mkdtemp(dir) != nullptr);
+    (void)snprintf(sock, sizeof(sock), "%s/sock", dir);
+    (void)snprintf(lock, sizeof(lock), "%s.lock", sock);
+    (void)snprintf(sa.sun_path, sizeof(sa.sun_path), "%s", sock);
+    lfd = control_listen(sock, &lock_fd);
+    CHECK(lfd >= 0);
+    if (lfd < 0)
+        return;
+    cl = unix_connect(&sa);
+    CHECK(cl >= 0 && write(cl, "stats\n", 6) == 6);
+    fd = control_accept(lfd, cmd, sizeof(cmd));
+    CHECK(fd >= 0);
+    CHECK_STR(cmd, "stats");
+    if (fd >= 0) { // the client does not read: the reply is cut off
+        char buf[4096] = {};
+
+        CHECK(fcntl(fd, F_GETFL) & O_NONBLOCK);
+        while (write(fd, buf, sizeof(buf)) > 0)
+            ;
+        CHECK_EQ(errno, EAGAIN);
+        (void)close(fd);
+    }
+    if (cl >= 0)
+        (void)close(cl);
+    cl = unix_connect(&sa);
+    CHECK(cl >= 0);
+    start = clock_ns(CLOCK_MONOTONIC);
+    fd = control_accept(lfd, cmd, sizeof(cmd));
+    CHECK(fd >= 0);
+    CHECK_STR(cmd, "");
+    CHECK(clock_ns(CLOCK_MONOTONIC) - start < NSEC_PER_SEC);
+    if (fd >= 0)
+        (void)close(fd);
+    if (cl >= 0)
+        (void)close(cl);
+    (void)close(lfd);
+    (void)close(lock_fd);
+    (void)unlink(sock);
+    (void)unlink(lock);
+    CHECK_EQ(rmdir(dir), 0);
+}
+
+/* /proc/net/vlan/config: VLAN ID and lower interface by name; header lines are skipped. */
 static void test_vlan_parse(void) {
     static const char listing[] = "VLAN Dev name\t | VLAN ID\n"
                                   "Name-Type: VLAN_NAME_TYPE_RAW_PLUS_VID_NO_PAD\n"
@@ -1265,6 +1331,7 @@ int main(void) {
     RUN_TEST(test_collector_max_message);
     RUN_TEST(test_control_lock);
     RUN_TEST(test_control_foreign_socket);
+    RUN_TEST(test_control_accept);
     RUN_TEST(test_vlan_parse);
     RUN_TEST(test_ipfix_message_layout);
     RUN_TEST(test_ipfix_icmp_and_ipv6);
