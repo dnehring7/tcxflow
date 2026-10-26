@@ -24,6 +24,7 @@
 #include <string.h>
 #include <sys/poll.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
@@ -48,6 +49,7 @@ static constexpr uint32_t CACHE_LIMIT_FACTOR = 8;           ///< the flow cache 
 static constexpr int DRAIN_RETRIES = 10; ///< failed map switches or drains in a row before tcxflow exits
 static constexpr uint64_t EXPORT_WAIT_NS = 200 * NSEC_PER_MSEC;    ///< tick: longest wait for full send buffers
 static constexpr uint64_t FINAL_EXPORT_WAIT_NS = 5 * NSEC_PER_SEC; ///< the same at shutdown
+static constexpr unsigned SEND_BATCH = 64;                         ///< IPFIX messages per sendmmsg() call
 
 /** Everything the exporter needs; one instance per process. */
 struct daemon {
@@ -57,6 +59,10 @@ struct daemon {
     struct ipfix_exporter ipfix;                  /**< IPFIX encoder */
     struct iface_table ifaces;                    /**< metered interfaces */
     struct collector coll[CONFIG_MAX_COLLECTORS]; /**< one per configured collector */
+    uint8_t out[SEND_BATCH][IPFIX_MSG_MAX];       /**< messages not sent yet */
+    struct iovec out_iov[SEND_BATCH];             /**< points to out */
+    struct mmsghdr out_mm[SEND_BATCH];            /**< points to out_iov */
+    unsigned n_out;                               /**< messages in out */
     int ctl_fd;                                   /**< listening control socket */
     int lock_fd;                                  /**< lock that guards the control socket */
     int undrained;                                /**< flow map left over from a failed drain, -1 = none */
@@ -104,12 +110,21 @@ static size_t template_message(void *ctx, unsigned index, uint8_t *buf, size_t l
     return ipfix_template_message(&d->ipfix, index, d->now_sec, buf, len);
 }
 
-/* ipfix_send_fn: every message goes to every collector, so collectors are redundant copies. */
+/* Every message goes to every collector, so collectors are redundant copies. */
+static void send_queued(struct daemon *d) {
+    for (int i = 0; i < d->cfg->n_collectors; i++)
+        collector_export_batch(&d->coll[i], d->out_mm, d->n_out, template_message, d);
+    d->n_out = 0;
+}
+
+/* ipfix_send_fn: queued, a busy tick sends SEND_BATCH messages per syscall instead of one. */
 static void send_message(void *ctx, const uint8_t *msg, size_t len) {
     struct daemon *d = ctx;
 
-    for (int i = 0; i < d->cfg->n_collectors; i++)
-        (void)collector_export(&d->coll[i], msg, len, template_message, d);
+    memcpy(d->out[d->n_out], msg, len);
+    d->out_iov[d->n_out].iov_len = len;
+    if (++d->n_out == SEND_BATCH)
+        send_queued(d);
 }
 
 /* cache_export_fn */
@@ -279,6 +294,7 @@ static void tick(struct daemon *d) {
     }
     (void)cache_expire(&d->cache, d->now_ns, false);
     ipfix_tick(&d->ipfix, d->now_ns, d->now_sec);
+    send_queued(d);
     check_target(d);
     d->tick_ns = clock_ns(CLOCK_MONOTONIC) - d->now_ns;
     if (d->tick_ns > d->tick_max_ns)
@@ -507,6 +523,7 @@ static int stop(struct daemon *d) {
         }
         (void)cache_expire(&d->cache, d->now_ns, true);
         ipfix_flush(&d->ipfix, d->now_sec);
+        send_queued(d);
         // Nothing retries after this: a message not sent now is lost for good.
         for (int i = 0; i < d->cfg->n_collectors; i++) {
             if (d->coll[i].errors != errors[i]) {
@@ -545,6 +562,10 @@ int daemon_run(const struct config *cfg) {
     d.ctl_fd = -1;
     d.lock_fd = -1;
     d.undrained = -1;
+    for (unsigned i = 0; i < SEND_BATCH; i++) {
+        d.out_iov[i].iov_base = d.out[i];
+        d.out_mm[i].msg_hdr = (struct msghdr){.msg_iov = &d.out_iov[i], .msg_iovlen = 1};
+    }
     for (int i = 0; i < CONFIG_MAX_COLLECTORS; i++)
         d.coll[i].fd = -1;
     ipfix_init(&d.ipfix, cfg->observation_domain, cfg->template_refresh * NSEC_PER_SEC,

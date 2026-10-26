@@ -129,12 +129,9 @@ static int send_templates(const struct collector *c, collector_templates_fn temp
     return 0;
 }
 
-int collector_export(struct collector *c, const void *msg, size_t len, collector_templates_fn templates, void *ctx) {
-    ssize_t n = 0;
-
-    if (c->templates_due && !send_templates(c, templates, ctx))
-        c->templates_due = false;
-    n = send_msg(c, msg, len);
+/* The rest of collector_export(), once the first attempt to send the message returned n. */
+static int export_result(struct collector *c, const void *msg, size_t len, collector_templates_fn templates, void *ctx,
+                         ssize_t n) {
     if (n < 0 && errno == ECONNREFUSED) {
         if (!c->refused)
             log_msg("collector %s: port unreachable, the collector is down or restarting", c->name);
@@ -162,6 +159,39 @@ int collector_export(struct collector *c, const void *msg, size_t len, collector
     c->refused = false;
     c->sent++;
     return 0;
+}
+
+int collector_export(struct collector *c, const void *msg, size_t len, collector_templates_fn templates, void *ctx) {
+    if (c->templates_due && !send_templates(c, templates, ctx))
+        c->templates_due = false;
+    return export_result(c, msg, len, templates, ctx, send_msg(c, msg, len));
+}
+
+void collector_export_batch(struct collector *c, struct mmsghdr *msgs, unsigned n, collector_templates_fn templates,
+                            void *ctx) {
+    for (unsigned i = 0; i < n;) {
+        const struct iovec *v = msgs[i].msg_hdr.msg_iov;
+        int k = 0;
+
+        if (c->templates_due || c->failing || c->refused) { // message by message until all is well
+            (void)collector_export(c, v->iov_base, v->iov_len, templates, ctx);
+            i++;
+            continue;
+        }
+        k = sendmmsg(c->fd, msgs + i, n - i, MSG_DONTWAIT);
+        if (k < 0) { // nothing sent, errno tells why: as for a single message
+            (void)export_result(c, v->iov_base, v->iov_len, templates, ctx,
+                                errno == EAGAIN ? send_msg(c, v->iov_base, v->iov_len) : -1);
+            i++;
+            continue;
+        }
+        c->sent += (unsigned)k;
+        i += (unsigned)k;
+        // Stopped early: a full buffer, or an error it reported to nobody, maybe a refusal by a
+        // restarted collector. The templates go first again, the next message waits for room.
+        if (i < n)
+            c->templates_due = true;
+    }
 }
 
 int collector_open(const char *spec, char *err, size_t errlen) {

@@ -10,6 +10,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/socket.h> // struct mmsghdr
 
 #define COLLECTOR_DEFAULT_PORT "4739" ///< IANA port for IPFIX, used when an address has none
 
@@ -86,5 +87,18 @@ typedef size_t (*collector_templates_fn)(void *ctx, unsigned index, uint8_t *buf
  */
 [[nodiscard]] int collector_export(struct collector *c, const void *msg, size_t len, collector_templates_fn templates,
                                    void *ctx);
+
+/**
+ * Send messages to a collector as collector_export() does, but all in one sendmmsg() call while
+ * the collector takes them: one syscall instead of one per message.
+ *
+ * @param c          collector
+ * @param msgs       messages, one iovec each; msg_len is overwritten
+ * @param n          number of messages
+ * @param templates  writes the template messages
+ * @param ctx        passed to @p templates
+ */
+void collector_export_batch(struct collector *c, struct mmsghdr *msgs, unsigned n, collector_templates_fn templates,
+                            void *ctx);
 
 #endif // TCXFLOW_COLLECTOR_H

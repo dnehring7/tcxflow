@@ -463,6 +463,132 @@ static void test_collector_waits_for_full_buffer(void) {
     (void)close(sv[1]);
 }
 
+static constexpr unsigned BATCH_N = 20;
+
+/* Messages "first", "first + 1", ... as a batch for collector_export_batch(). */
+static void make_batch(struct mmsghdr *mm, struct iovec *iov, char (*text)[4], unsigned n, unsigned first) {
+    for (unsigned i = 0; i < n; i++) {
+        iov[i].iov_len = (size_t)snprintf(text[i], sizeof(text[i]), "%u", first + i);
+        iov[i].iov_base = text[i];
+        mm[i].msg_hdr = (struct msghdr){.msg_iov = &iov[i], .msg_iovlen = 1};
+    }
+}
+
+/* Datagrams on rx must be @p want, in this order. */
+static void expect_strs(int rx, const char *const *want, int n) {
+    char buf[16];
+
+    for (int i = 0; i < n; i++) {
+        recv_str(rx, buf, sizeof(buf));
+        CHECK_STR(buf, want[i]);
+    }
+}
+
+/*
+ * A batch goes out as single messages would: the templates first when due, and after a refusal by
+ * a restarted collector, the templates and the refused message again, then the rest.
+ */
+static void test_collector_batch(void) {
+    static const char *const first[] = {"T", "0", "1", "2"};
+    static const char *const second[] = {"3", "4"};
+    static const char *const third[] = {"T", "6", "7", "8"};
+    struct collector c = {.name = "batch", .fd = -1, .templates_due = true};
+    struct mmsghdr mm[3];
+    struct iovec iov[3];
+    char text[3][4];
+    uint16_t port = 0;
+    char spec[32];
+    char err[256];
+    int rx = udp_listen(&port);
+
+    CHECK(rx >= 0);
+    if (rx < 0)
+        return;
+    (void)snprintf(spec, sizeof(spec), "127.0.0.1:%u", port);
+    c.fd = collector_open(spec, err, sizeof(err));
+    CHECK(c.fd >= 0);
+    if (c.fd < 0) {
+        (void)close(rx);
+        return;
+    }
+    make_batch(mm, iov, text, 3, 0);
+    collector_export_batch(&c, mm, 3, test_templates, nullptr);
+    expect_strs(rx, first, 4);
+    make_batch(mm, iov, text, 2, 3);
+    collector_export_batch(&c, mm, 2, test_templates, nullptr);
+    expect_strs(rx, second, 2);
+    (void)close(rx); // the collector restarts
+    make_batch(mm, iov, text, 1, 5);
+    collector_export_batch(&c, mm, 1, test_templates, nullptr); // the kernel answers port unreachable
+    (void)usleep(20000);                                        // the error is now pending on fd
+    rx = udp_listen(&port);
+    CHECK(rx >= 0);
+    if (rx >= 0) {
+        make_batch(mm, iov, text, 3, 6);
+        collector_export_batch(&c, mm, 3, test_templates, nullptr);
+        expect_strs(rx, third, 4);
+        (void)close(rx);
+    }
+    CHECK(!c.refused);
+    CHECK_EQ(c.sent, 9);
+    CHECK_EQ(c.errors, 0);
+    (void)close(c.fd);
+}
+
+/*
+ * A batch into a full send buffer that holds fewer messages than the batch: every message arrives,
+ * once and in order, and the templates once more after the batch stopped early.
+ */
+static void test_collector_batch_full_buffer(void) {
+    struct collector c = {.name = "slow", .fd = -1};
+    struct mmsghdr mm[BATCH_N];
+    struct iovec iov[BATCH_N];
+    char text[BATCH_N][4];
+    int sv[2] = {-1, -1};
+    int sndbuf = 4096; // a few datagrams
+    pid_t pid = -1;
+    int status = -1;
+
+    CHECK_EQ(socketpair(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, sv), 0);
+    if (sv[0] < 0)
+        return;
+    CHECK_EQ(setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)), 0);
+    c.fd = sv[0];
+    while (send(sv[0], "fill", 4, MSG_DONTWAIT) == 4)
+        ;
+    pid = fork();
+    if (pid == 0) { // the collector catches up after 50 ms and checks what it gets
+        struct pollfd pfd = {.fd = sv[1], .events = POLLIN};
+        unsigned next = 0;
+        bool templates = false;
+        char buf[16];
+
+        (void)usleep(50000);
+        while (poll(&pfd, 1, 500) == 1) {
+            const ssize_t n = recv(sv[1], buf, sizeof(buf) - 1, MSG_DONTWAIT);
+
+            if (n <= 0)
+                continue;
+            buf[n] = '\0';
+            templates |= !strcmp(buf, "T");
+            if (strcmp(buf, "fill") != 0 && strcmp(buf, "T") != 0 && strtoul(buf, nullptr, 10) != next++)
+                _exit(1);
+        }
+        if (next != BATCH_N)
+            _exit(2);
+        _exit(templates ? 0 : 3);
+    }
+    c.wait_until_ns = clock_ns(CLOCK_MONOTONIC) + (2 * NSEC_PER_SEC);
+    make_batch(mm, iov, text, BATCH_N, 0);
+    collector_export_batch(&c, mm, BATCH_N, test_templates, nullptr);
+    CHECK_EQ(c.sent, BATCH_N);
+    CHECK_EQ(c.errors, 0);
+    (void)waitpid(pid, &status, 0);
+    CHECK_EQ(WIFEXITED(status) ? WEXITSTATUS(status) : -1, 0);
+    (void)close(sv[0]);
+    (void)close(sv[1]);
+}
+
 /* The path MTU of a connected collector socket is known, less the IPv4 or IPv6 and UDP headers. */
 static void test_collector_max_message(void) {
     const char *const specs[] = {"127.0.0.1:9", "[::1]:9"};
@@ -588,7 +714,7 @@ static void test_control_foreign_socket(void) {
         int status = 0;
 
         (void)wait(&status);
-        CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0); // empty reply: ENODATA
+        CHECK_EQ(WIFEXITED(status) ? WEXITSTATUS(status) : -1, 0); // empty reply: ENODATA
     }
     (void)close(other);
     if (out)
@@ -1511,6 +1637,8 @@ int main(void) {
     RUN_TEST(test_collector_export_after_refused);
     RUN_TEST(test_collector_templates_after_failure);
     RUN_TEST(test_collector_waits_for_full_buffer);
+    RUN_TEST(test_collector_batch);
+    RUN_TEST(test_collector_batch_full_buffer);
     RUN_TEST(test_collector_max_message);
     RUN_TEST(test_control_lock);
     RUN_TEST(test_control_foreign_socket);
