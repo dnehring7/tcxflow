@@ -14,7 +14,7 @@
 #   make lint             static analysis with clang-tidy (checks in .clang-tidy) and shellcheck
 #   make check            check-indent, lint, make dev and the unit tests
 #   make docs             Doxygen documentation in docs/html
-#   make dist             source tarball ../tcxflow-VERSION.tar.gz
+#   make dist             source tarball ../tcxflow-VERSION.tar.gz of the committed HEAD
 #   sudo make install     binary, systemd unit and example configuration
 #   sudo make uninstall   remove the binary and the systemd unit
 #   make clean            remove everything the build created
@@ -261,11 +261,9 @@ docs:
 	@command -v doxygen >/dev/null 2>&1 || { echo "doxygen not found"; exit 1; }
 	@doxygen && echo "Doxygen documentation written to docs/html/index.html"
 
-dist: clean
-	@-rm -f ../tcxflow-$(VERSION).tar.gz
-	@cd .. && tar czf tcxflow-$(VERSION).tar.gz \
-		--transform='s|^$(notdir $(CURDIR))|tcxflow-$(VERSION)|' \
-		--exclude=.git --exclude='*.tar.gz' $(notdir $(CURDIR))
+# The committed tree only: no build output, no local files .gitignore hides (rpmbuild -ta takes it as is).
+dist:
+	@git archive --prefix=tcxflow-$(VERSION)/ -o ../tcxflow-$(VERSION).tar.gz HEAD
 	@echo "Distribution package created as ../tcxflow-$(VERSION).tar.gz"
 
 install: tcxflow

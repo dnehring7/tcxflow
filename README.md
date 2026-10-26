@@ -417,7 +417,7 @@ What matters for flow accounting:
 | `make lint` | clang-tidy (`.clang-tidy`), one stamp per file, parallel (`NJOBS=`); shellcheck for `tests/*.sh` |
 | `make check` | `check-indent`, `lint`, `make dev` and the unit tests |
 | `make docs` | Doxygen documentation in `docs/html` |
-| `make dist` | source tarball `../tcxflow-VERSION.tar.gz` |
+| `make dist` | source tarball `../tcxflow-VERSION.tar.gz` of the committed `HEAD` |
 | `sudo make install` | binary, systemd unit and example configuration (`PREFIX`, `DESTDIR`) |
 | `sudo make uninstall` | remove the binary and the unit |
 | `make clean` | remove everything the build created |
