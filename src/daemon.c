@@ -177,11 +177,12 @@ static void warn_if_lost(struct daemon *d) {
     d->lost_seen = st[STAT_FULL_PKTS];
 }
 
-/* Deleting a device detaches all its links, even if a namesake comes back: one link tells. */
+/* A link can be detached on its own (bpftool link detach), not only with its interface. */
 static bool links_attached(const struct iface_state *s) {
-    const struct bpf_link *l = s->link[FLOW_DIR_IN] ? s->link[FLOW_DIR_IN] : s->link[FLOW_DIR_OUT];
-
-    return !l || meter_link_ifindex(l) == s->ifindex;
+    for (int dir = FLOW_DIR_IN; dir <= FLOW_DIR_OUT; dir++)
+        if (s->link[dir] && meter_link_ifindex(s->link[dir]) != s->ifindex)
+            return false;
+    return true;
 }
 
 /* Checked every second per interface: if_nametoindex() opens and closes a socket per call. */
@@ -215,7 +216,7 @@ static void check_target(struct daemon *d) {
         struct iface_state *s = &d->ifaces.ifs[i];
 
         if (!s->gone && (name_to_index(d, s->cfg) != s->ifindex || !links_attached(s))) {
-            log_msg("interface %s is gone, exiting", s->cfg->name);
+            log_msg("interface %s is gone or detached, exiting", s->cfg->name);
             s->gone = true;
             d->target_gone = true;
             stop_requested = 1;

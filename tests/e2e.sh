@@ -392,6 +392,21 @@ wait_started $DAEMON "$WORK/tcxflow-replace.log"
 printf 'link del trep\nlink add trep index %s type veth peer name trep-peer\n' "$REP" | nsx "$DP" ip -batch -
 expect_exit $DAEMON "$WORK/tcxflow-replace.log" "interface trep is gone" "interface replaced (index $REP)"
 
+# --- one direction detached on its own: it is no longer metered, tcxflow must notice and exit ---
+for dir in ingress egress; do
+    if ! command -v bpftool >/dev/null; then
+        printf 'skip  %s link detached (no bpftool)\n' "$dir"
+        continue
+    fi
+    "${TCX[@]}" --config "$WORK/replace.conf" >"$WORK/tcxflow-detach.log" 2>&1 &
+    DAEMON=$!
+    PIDS+=("$DAEMON")
+    wait_started $DAEMON "$WORK/tcxflow-detach.log"
+    LINK=$(awk -v dir="($dir)" '/^link_id:/ {id = $2} /^attach_type:/ && index($0, dir) {print id}' /proc/"$DAEMON"/fdinfo/*)
+    bpftool link detach id "${LINK:-0}" || fail "$dir link not found"
+    expect_exit $DAEMON "$WORK/tcxflow-detach.log" "interface trep is gone or detached" "$dir link detached"
+done
+
 # --- an interface given twice, by name and by altname: refused at start ------------------
 nsx "$DP" ip link property add dev trep altname trep-alt
 "${TCX[@]}" --netns "$DP" -i trep:in -i trep-alt:out --collector "127.0.0.1:$PORT1" --socket "$WORK/alt.sock" \
