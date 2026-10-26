@@ -13,6 +13,8 @@
 
 #include "daemon.h"
 
+#include <linux/sockios.h>
+
 #include <errno.h>
 #include <fcntl.h>
 #include <net/if.h>
@@ -22,8 +24,10 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/poll.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
@@ -59,6 +63,7 @@ struct daemon {
     struct collector coll[CONFIG_MAX_COLLECTORS]; /**< one per configured collector */
     int ctl_fd;                                   /**< listening control socket */
     int lock_fd;                                  /**< lock that guards the control socket */
+    int ifreq_fd;                                 /**< socket in the metered namespace for interface ioctls */
     int undrained;                                /**< flow map left over from a failed drain, -1 = none */
     uint64_t drain_errors;                        /**< failed map switches or drains */
     int64_t mono2real;                            /**< CLOCK_REALTIME - CLOCK_MONOTONIC in nanoseconds */
@@ -173,12 +178,25 @@ static void warn_if_lost(struct daemon *d) {
     d->lost_seen = st[STAT_FULL_PKTS];
 }
 
-/* The kernel detached the links when the interface was deleted, even if one with its name and index came back. */
+/*
+ * The kernel detached the links when the interface was deleted, even if one with its name and index
+ * came back. It detaches all links of a device at once: checking one is enough.
+ */
 static bool links_attached(const struct iface_state *s) {
-    for (int dir = 0; dir < 2; dir++)
-        if (s->link[dir] && meter_link_ifindex(s->link[dir]) != s->ifindex)
-            return false;
-    return true;
+    const struct bpf_link *l = s->link[FLOW_DIR_IN] ? s->link[FLOW_DIR_IN] : s->link[FLOW_DIR_OUT];
+
+    return !l || meter_link_ifindex(l) == s->ifindex;
+}
+
+/* Checked every second per interface: if_nametoindex() opens and closes a socket per call. */
+static unsigned name_to_index(const struct daemon *d, const struct iface_config *cfg) {
+    struct ifreq ifr = {};
+
+    static_assert(sizeof(cfg->name) == sizeof(ifr.ifr_name), "interface name size");
+    if (d->ifreq_fd < 0)
+        return if_nametoindex(cfg->name);
+    memcpy(ifr.ifr_name, cfg->name, sizeof(ifr.ifr_name));
+    return ioctl(d->ifreq_fd, SIOCGIFINDEX, &ifr) ? 0 : (unsigned)ifr.ifr_ifindex;
 }
 
 /*
@@ -200,7 +218,7 @@ static void check_target(struct daemon *d) {
     for (int i = 0; i < d->ifaces.n; i++) {
         struct iface_state *s = &d->ifaces.ifs[i];
 
-        if (!s->gone && (if_nametoindex(s->cfg->name) != s->ifindex || !links_attached(s))) {
+        if (!s->gone && (name_to_index(d, s->cfg) != s->ifindex || !links_attached(s))) {
             log_msg("interface %s is gone, exiting", s->cfg->name);
             s->gone = true;
             d->target_gone = true;
@@ -392,7 +410,7 @@ static int enter_netns(struct daemon *d) {
 static int attach_interfaces(struct daemon *d) {
     for (int i = 0; i < d->cfg->n_ifaces; i++) {
         const struct iface_config *cfg = &d->cfg->ifaces[i];
-        const unsigned ifindex = if_nametoindex(cfg->name);
+        const unsigned ifindex = name_to_index(d, cfg);
         struct iface_state *s = nullptr;
         char vlan[16];
 
@@ -475,6 +493,7 @@ static int start(struct daemon *d) {
     }
     if (d->cfg->netns[0] && enter_netns(d))
         return -1;
+    d->ifreq_fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0); // ioctls act in its namespace; -1: if_nametoindex()
     return attach_interfaces(d);
 }
 
@@ -532,6 +551,8 @@ static int stop(struct daemon *d) {
     for (int i = 0; i < d->cfg->n_collectors; i++)
         if (d->coll[i].fd >= 0)
             (void)close(d->coll[i].fd);
+    if (d->ifreq_fd >= 0)
+        (void)close(d->ifreq_fd);
     cache_destroy(&d->cache);
     return rc;
 }
@@ -546,6 +567,7 @@ int daemon_run(const struct config *cfg) {
     d.cfg = cfg;
     d.ctl_fd = -1;
     d.lock_fd = -1;
+    d.ifreq_fd = -1;
     d.undrained = -1;
     for (int i = 0; i < CONFIG_MAX_COLLECTORS; i++)
         d.coll[i].fd = -1;
