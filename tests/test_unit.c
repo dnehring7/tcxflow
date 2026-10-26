@@ -116,6 +116,7 @@ static void test_config_defaults(void) {
     CHECK_EQ(cfg.active_timeout, 1800);
     CHECK_EQ(cfg.max_flows, 131072);
     CHECK_EQ(cfg.observation_domain, 1);
+    CHECK_EQ(cfg.export_interval, 10);
     CHECK_STR(cfg.netns, "");
     CHECK_STR(cfg.socket, CONFIG_DEFAULT_SOCKET);
 }
@@ -134,6 +135,7 @@ static void test_config_file(void) {
                                "active-timeout   120\n"
                                "max-flows 65536\n"
                                "observation-domain 4711\n"
+                               "export-interval 1\n"
                                "socket /run/test.sock\n";
     struct config cfg;
     char err[256] = "";
@@ -155,6 +157,7 @@ static void test_config_file(void) {
     CHECK_EQ(cfg.active_timeout, 120);
     CHECK_EQ(cfg.max_flows, 65536);
     CHECK_EQ(cfg.observation_domain, 4711);
+    CHECK_EQ(cfg.export_interval, 1);
     CHECK_STR(cfg.socket, "/run/test.sock");
     CHECK_EQ(config_validate(&cfg, err, sizeof(err)), 0);
 }
@@ -177,6 +180,7 @@ static void test_config_errors(void) {
         {"active-timeout -5\n", "must be a number"},
         {"max-flows 100\n", "max-flows must be a number from 1024"},
         {"observation-domain 4294967296\n", "must be a number"},
+        {"export-interval 61\n", "export-interval must be a number from 1 to 60"},
         {"netns relative/path\n", "netns must be a name or an absolute path"},
         {"socket run/x.sock\n", "socket must be an absolute path"},
     };

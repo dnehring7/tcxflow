@@ -53,6 +53,7 @@ static void usage(FILE *out) {
                   "      --cache-flows N           flows cached until they end, at most (8 * max-flows)\n"
                   "      --observation-domain ID   IPFIX observation domain id (1)\n"
                   "      --template-refresh SEC    send the IPFIX templates at least every SEC seconds (60)\n"
+                  "      --export-interval SEC     send a partly filled IPFIX message after SEC seconds (10)\n"
                   "  -s, --socket PATH             control socket (%s)\n"
                   "\n"
                   "Other options:\n"
@@ -113,6 +114,7 @@ int main(int argc, char **argv) {
         {"cache-flows", required_argument, nullptr, 0},
         {"observation-domain", required_argument, nullptr, 0},
         {"template-refresh", required_argument, nullptr, 0},
+        {"export-interval", required_argument, nullptr, 0},
         {"socket", required_argument, nullptr, 0},
         {"config", required_argument, nullptr, 'c'},
         {"verbose", no_argument, nullptr, 'v'},

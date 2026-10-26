@@ -98,6 +98,7 @@ static int add_collector(struct config *cfg, const char *value, char *err, size_
 void config_init(struct config *cfg) {
     memset(cfg, 0, sizeof(*cfg));
     cfg->template_refresh = 60;
+    cfg->export_interval = 10;
     cfg->inactive_timeout = 15;
     cfg->active_timeout = 1800;
     cfg->max_flows = 131072;
@@ -126,6 +127,8 @@ int config_set(struct config *cfg, const char *key, const char *value, char *err
         return set_number(key, value, 1024, 1UL << 27, &cfg->cache_flows, err, errlen);
     if (!strcmp(key, "template-refresh"))
         return set_number(key, value, 1, 86400, &cfg->template_refresh, err, errlen);
+    if (!strcmp(key, "export-interval"))
+        return set_number(key, value, 1, 60, &cfg->export_interval, err, errlen);
     if (!strcmp(key, "observation-domain"))
         return set_number(key, value, 0, UINT32_MAX, &cfg->observation_domain, err, errlen);
     if (!strcmp(key, "netns")) {

@@ -129,6 +129,7 @@ collector        127.0.0.1:$PORT1
 collector        127.0.0.1:$PORT2
 inactive-timeout 2
 active-timeout   2
+export-interval  1
 socket           $WORK/tcxflow.sock
 EOF
 mkdir "$WORK/c1" "$WORK/c2"
@@ -308,6 +309,7 @@ netns            $DP
 interface        tcol:out
 collector        127.0.0.1:$PORT3
 inactive-timeout 1
+export-interval  1
 socket           $WORK/restart.sock
 EOF
 datagram() { nsx "$DP" bash -c "printf x >/dev/udp/10.77.0.99/$1"; } # 29 bytes
@@ -342,6 +344,32 @@ if [[ $GOT == "1 29" ]] && grep -q 'collector 127.0.0.1:.*port unreachable' "$WO
 else
     fail "collector restarted: got \"$GOT\" of the record that came first, expected 1 29"
     cat "$WORK/tcxflow-restart.log"
+fi
+
+# --- export-interval: a partly filled message waits, the final export still sends it ---------
+sed -e "s|restart.sock|batch.sock|" -e "s|^export-interval.*|export-interval  60|" "$WORK/restart.conf" >"$WORK/batch.conf"
+mkdir "$WORK/batch"
+ip netns exec "$MGMT" nfcapd -b 127.0.0.1 -p "$PORT3" -w "$WORK/batch" >/dev/null 2>&1 &
+COLL=$!
+PIDS+=("$COLL")
+sleep 1
+"${TCX[@]}" --config "$WORK/batch.conf" >"$WORK/tcxflow-batch.log" 2>&1 &
+DAEMON=$!
+PIDS+=("$DAEMON")
+wait_started $DAEMON "$WORK/tcxflow-batch.log"
+datagram 65004
+sleep 3 # the flow ended (inactive-timeout 1), its record waits in the open message
+BATCHED=$("${TCX[@]}" --config "$WORK/batch.conf" stats | grep -c '^ipfix messages *0$' || true)
+kill -TERM $DAEMON
+wait $DAEMON || true
+kill -TERM $COLL
+wait $COLL || true
+GOT=$(nfdump -R "$WORK/batch" -N -q -o 'fmt:%pkt %byt' 'proto udp and dst port 65004' | awk '{p += $1; b += $2} END {print p + 0, b + 0}')
+if [[ $BATCHED == 1 && $GOT == "1 29" ]]; then
+    ok "export-interval: record held back, sent by the final export"
+else
+    fail "export-interval: held back $BATCHED (expected 1), got \"$GOT\" (expected 1 29)"
+    cat "$WORK/tcxflow-batch.log"
 fi
 
 # --- an interface replaced by one with the same name and index: the kernel detached tcxflow's

@@ -20,4 +20,4 @@ Build `make dev` (strict `-Werror`, GCC `-fanalyzer`; plain `make` is the lenien
 
 ## Lifecycle (match existing patterns)
 - `*_init`/`*_open` pair with `*_destroy`/`*_close`: init leaves a valid empty state even when it fails; close works on a zeroed object and zeroes it.
-- `start()` opens sockets in the original namespace, loads BPF, enters `netns`, attaches. `tick()` once per second: swap, drain, expire, flush. `stop()` detaches, drains both maps, exports everything, releases in reverse; exit status 1 when an interface or the namespace vanished, systemd restarts.
+- `start()` opens sockets in the original namespace, loads BPF, enters `netns`, attaches. `tick()` once per second: swap, drain, expire; flush every `export-interval` ticks. `stop()` detaches, drains both maps, exports everything, releases in reverse; exit status 1 when an interface or the namespace vanished, systemd restarts.

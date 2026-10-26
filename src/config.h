@@ -50,11 +50,12 @@ struct config {
     int n_collectors;                                          /**< entries used in collectors */
     uint32_t observation_domain;                               /**< IPFIX observation domain id */
     uint32_t template_refresh;                                 /**< templates at least every so many seconds */
-    uint32_t inactive_timeout;                                 /**< seconds */
-    uint32_t active_timeout;                                   /**< seconds */
-    uint32_t max_flows;                                        /**< BPF flow table size per one-second interval */
-    uint32_t cache_flows;                                      /**< flows cached at most, 0 = 8 * max_flows */
-    char socket[CONFIG_SOCKET_MAX];                            /**< control socket path */
+    uint32_t export_interval;       /**< seconds a partly filled message waits for more records */
+    uint32_t inactive_timeout;      /**< seconds */
+    uint32_t active_timeout;        /**< seconds */
+    uint32_t max_flows;             /**< BPF flow table size per one-second interval */
+    uint32_t cache_flows;           /**< flows cached at most, 0 = 8 * max_flows */
+    char socket[CONFIG_SOCKET_MAX]; /**< control socket path */
 };
 
 /**
