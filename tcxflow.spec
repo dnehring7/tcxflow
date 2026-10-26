@@ -14,6 +14,9 @@ URL:            https://github.com/dnehring7/tcxflow
 Source0:        %{url}/archive/refs/tags/v%{version}.tar.gz#/%{name}-%{version}.tar.gz
 ExclusiveArch:  x86_64
 
+# One package for every x86-64 CPU: EL 10 builds for x86-64-v3 by default (AVX2), Fedora for the baseline.
+%global __cflags_arch_x86_64_level %{nil}
+
 BuildRequires:  bpftool
 BuildRequires:  clang >= 19
 BuildRequires:  gcc >= 14
