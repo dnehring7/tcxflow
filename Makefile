@@ -165,7 +165,7 @@ build/meter.o: $(SKEL)
 # Tests
 # ------------------------------------------------------------
 build/test_unit: tests/test_unit.c tests/test.h $(UNIT_OBJS) $(HEADERS) build/.flags
-	$(LINK) $(TCX_CPPFLAGS) $(CPPFLAGS) $< $(UNIT_OBJS) -o $@
+	$(LINK) $(TCX_CPPFLAGS) $(CPPFLAGS) $< $(UNIT_OBJS) -Wl,--wrap=sendmmsg -o $@
 
 build/test_bpf: tests/test_bpf.c tests/test.h $(BPF_TEST_OBJS) $(HEADERS) build/.flags
 	$(LINK) $(TCX_CPPFLAGS) $(CPPFLAGS) $< $(BPF_TEST_OBJS) -o $@ $(LDLIBS)

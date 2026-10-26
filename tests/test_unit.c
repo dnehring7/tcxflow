@@ -465,6 +465,21 @@ static void test_collector_waits_for_full_buffer(void) {
     (void)close(sv[1]);
 }
 
+/* sendmmsg() of the collector code (linked with --wrap): the next call sends at most this many, 0 = all. */
+static unsigned sendmmsg_limit;
+
+// NOLINTBEGIN(bugprone-reserved-identifier,cert-dcl37-c,cert-dcl51-cpp,misc-use-internal-linkage)
+extern int __real_sendmmsg(int fd, struct mmsghdr *mm, unsigned n, int flags);
+int __wrap_sendmmsg(int fd, struct mmsghdr *mm, unsigned n, int flags);
+
+int __wrap_sendmmsg(int fd, struct mmsghdr *mm, unsigned n, int flags) {
+    const unsigned limit = sendmmsg_limit;
+
+    sendmmsg_limit = 0;
+    return __real_sendmmsg(fd, mm, limit && limit < n ? limit : n, flags);
+}
+// NOLINTEND(bugprone-reserved-identifier,cert-dcl37-c,cert-dcl51-cpp,misc-use-internal-linkage)
+
 static constexpr unsigned BATCH_N = 20;
 
 /* Messages "first", "first + 1", ... as a batch for collector_export_batch(). */
@@ -555,9 +570,9 @@ static void drain_all([[maybe_unused]] int sig) {
 }
 
 /*
- * A batch into a send buffer with room for 3 of its messages: the batch stops early, the templates
- * go first again, then every message arrives, once and in order. No second process: a timer
- * drains the buffer, so what fits when does not depend on scheduling.
+ * A batch into a full send buffer: the first call sends 3 messages (a timer that already drained the
+ * buffer cannot make all fit), the templates go first again, then every message arrives, once and
+ * in order. No second process: the timer drains the buffer while the sender waits.
  */
 static void test_collector_batch_full_buffer(void) {
     struct sigaction sa = {.sa_handler = drain_all}; // no SA_RESTART: poll() returns
@@ -586,6 +601,7 @@ static void test_collector_batch_full_buffer(void) {
     CHECK_EQ(setitimer(ITIMER_REAL, &every_20ms, nullptr), 0);
     c.wait_until_ns = clock_ns(CLOCK_MONOTONIC) + (2 * NSEC_PER_SEC);
     make_batch(mm, iov, text, BATCH_N, 0);
+    sendmmsg_limit = 3;
     collector_export_batch(&c, mm, BATCH_N, test_templates, nullptr);
     (void)setitimer(ITIMER_REAL, &off, nullptr);
     (void)signal(SIGALRM, SIG_DFL);
