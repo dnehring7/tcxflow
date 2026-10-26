@@ -46,6 +46,8 @@ static constexpr uint32_t CACHE_BUCKETS = 65536;            ///< initial hash bu
 static constexpr uint32_t CACHE_LIMIT_FACTOR = 8;           ///< the flow cache holds at most this many times max-flows
 static constexpr unsigned IFMAP_SIZE = 128;                 ///< ifindex lookup slots
 static constexpr int DRAIN_RETRIES = 10; ///< failed map switches or drains in a row before tcxflow exits
+static constexpr uint64_t EXPORT_WAIT_NS = 200 * NSEC_PER_MSEC;    ///< tick: longest wait for full send buffers
+static constexpr uint64_t FINAL_EXPORT_WAIT_NS = 5 * NSEC_PER_SEC; ///< the same at shutdown
 
 // Masking with IFMAP_SIZE - 1 needs a power of two; at most half full keeps the probe chains short.
 static_assert((IFMAP_SIZE & (IFMAP_SIZE - 1)) == 0 && IFMAP_SIZE >= 2 * CONFIG_MAX_IFACES, "IFMAP_SIZE");
@@ -266,6 +268,12 @@ static void check_target(struct daemon *d) {
     }
 }
 
+/* One absolute deadline: a slow collector delays the tick by wait_ns at most, however much it sends. */
+static void set_export_deadline(struct daemon *d, uint64_t wait_ns) {
+    for (int i = 0; i < d->cfg->n_collectors; i++)
+        d->coll[i].wait_until_ns = d->now_ns + wait_ns;
+}
+
 /* The largest message that fits the path MTU of every collector: all get the same messages. */
 static size_t export_max_len(const struct daemon *d) {
     size_t max = 0;
@@ -294,6 +302,7 @@ static void drain_failed(struct daemon *d, const char *what, int err) {
 
 static void tick(struct daemon *d) {
     set_now(d);
+    set_export_deadline(d, EXPORT_WAIT_NS);
     // Re-read every tick: path MTU discovery or a route change can lower it at any time.
     ipfix_set_max_len(&d->ipfix, export_max_len(d));
     // A map that could not be drained completely must not become active again: old and new
@@ -553,6 +562,8 @@ static int stop(struct daemon *d) {
         // any: that one first, so the cache gets them in time order. After a switch it is active.
         older = swapped < 0 ? d->meter.active ^ 1U : d->meter.active;
         set_now(d);
+        // The whole cache goes out at once; systemd allows 90 s to stop.
+        set_export_deadline(d, FINAL_EXPORT_WAIT_NS);
         ipfix_set_max_len(&d->ipfix, export_max_len(d)); // a signal can come before the first tick
         for (int i = 0; i < d->cfg->n_collectors; i++)
             errors[i] = d->coll[i].errors;

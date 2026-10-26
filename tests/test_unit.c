@@ -395,6 +395,45 @@ static void test_collector_templates_after_failure(void) {
     (void)close(rx);
 }
 
+/* A full send buffer is waited for until the deadline. Unix datagrams: UDP loopback never fills. */
+static void test_collector_waits_for_full_buffer(void) {
+    struct collector c = {.name = "slow", .fd = -1};
+    int sv[2] = {-1, -1};
+    uint64_t start = 0;
+    pid_t pid = -1;
+    int status = 0;
+
+    CHECK_EQ(socketpair(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, sv), 0);
+    if (sv[0] < 0)
+        return;
+    c.fd = sv[0];
+    while (send(sv[0], "fill", 4, MSG_DONTWAIT) == 4)
+        ;
+    CHECK_EQ(errno, EAGAIN);
+    CHECK_EQ(collector_export(&c, "now", 3, test_templates, nullptr), -1); // no deadline: no waiting
+    CHECK_EQ(errno, EAGAIN);
+    pid = fork();
+    if (pid == 0) { // the collector catches up after 50 ms
+        struct pollfd pfd = {.fd = sv[1], .events = POLLIN};
+        char buf[16];
+
+        (void)usleep(50000);
+        while (poll(&pfd, 1, 500) == 1)
+            (void)recv(sv[1], buf, sizeof(buf), MSG_DONTWAIT);
+        _exit(0);
+    }
+    start = clock_ns(CLOCK_MONOTONIC);
+    c.wait_until_ns = start + (2 * NSEC_PER_SEC);
+    CHECK_EQ(collector_export(&c, "later", 5, test_templates, nullptr), 0);
+    CHECK(clock_ns(CLOCK_MONOTONIC) - start >= 40 * NSEC_PER_MSEC); // it waited for room
+    CHECK(!c.templates_due);                                        // and sent the templates
+    CHECK_EQ(c.sent, 1);
+    CHECK_EQ(c.errors, 1);
+    (void)waitpid(pid, &status, 0);
+    (void)close(sv[0]);
+    (void)close(sv[1]);
+}
+
 /* The path MTU of a connected collector socket is known. */
 static void test_collector_max_message(void) {
     char err[256];
@@ -1218,6 +1257,7 @@ int main(void) {
     RUN_TEST(test_collector_split);
     RUN_TEST(test_collector_export_after_refused);
     RUN_TEST(test_collector_templates_after_failure);
+    RUN_TEST(test_collector_waits_for_full_buffer);
     RUN_TEST(test_collector_max_message);
     RUN_TEST(test_control_lock);
     RUN_TEST(test_control_foreign_socket);

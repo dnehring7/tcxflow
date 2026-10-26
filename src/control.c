@@ -23,9 +23,8 @@
 
 #include "util.h"
 
-static constexpr time_t IO_TIMEOUT_SEC = 2;          ///< send and receive timeout of a control connection
-static constexpr uint64_t CMD_TIMEOUT_MS = 200;      ///< the daemon waits this long at most for a command
-static constexpr uint64_t NSEC_PER_MSEC = 1'000'000; ///< nanoseconds per millisecond
+static constexpr time_t IO_TIMEOUT_SEC = 2;     ///< send and receive timeout of a control connection
+static constexpr uint64_t CMD_TIMEOUT_MS = 200; ///< the daemon waits this long at most for a command
 
 static int make_addr(const char *path, struct sockaddr_un *sa) {
     memset(sa, 0, sizeof(*sa));

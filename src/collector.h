@@ -15,13 +15,14 @@
 
 /** A collector: its socket and the state of the message stream to it. */
 struct collector {
-    const char *name;   /**< address as configured, for log messages */
-    int fd;             /**< connected UDP socket from collector_open(), -1 = none */
-    uint64_t sent;      /**< messages sent */
-    uint64_t errors;    /**< messages that could not be sent */
-    uint64_t failing;   /**< messages not sent since the last one that was */
-    bool refused;       /**< the last message was refused: the collector is down or restarting */
-    bool templates_due; /**< send the templates before the next message */
+    const char *name;       /**< address as configured, for log messages */
+    int fd;                 /**< connected UDP socket from collector_open(), -1 = none */
+    uint64_t sent;          /**< messages sent */
+    uint64_t errors;        /**< messages that could not be sent */
+    uint64_t failing;       /**< messages not sent since the last one that was */
+    uint64_t wait_until_ns; /**< wait for room in a full send buffer until then (CLOCK_MONOTONIC), 0 = never */
+    bool refused;           /**< the last message was refused: the collector is down or restarting */
+    bool templates_due;     /**< send the templates before the next message */
 };
 
 /**
@@ -72,7 +73,8 @@ typedef size_t (*collector_templates_fn)(void *ctx, unsigned index, uint8_t *buf
  * error: the templates, which a restarted collector no longer knows, go out, then the message
  * once more. A message that could not be sent may have carried the templates: they precede the
  * next one. Only this collector gets them, the others are not affected. The first failure and
- * the recovery are logged, not every message.
+ * the recovery are logged, not every message. A full send buffer is waited for until
+ * c->wait_until_ns, not longer.
  *
  * @param c          collector
  * @param msg        message

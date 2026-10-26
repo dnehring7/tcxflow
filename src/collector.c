@@ -8,14 +8,17 @@
 #include "collector.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "util.h"
@@ -91,12 +94,32 @@ size_t collector_max_message(int fd) {
     return (size_t)mtu - IPV4_UDP_HDRS;
 }
 
+/* A full send buffer is a burst (many flows ending at once), not a lost collector: wait, bounded. */
+static ssize_t send_msg(const struct collector *c, const void *msg, size_t len) {
+    ssize_t n = send(c->fd, msg, len, MSG_DONTWAIT);
+
+    while (n < 0 && errno == EAGAIN) {
+        const uint64_t now = clock_ns(CLOCK_MONOTONIC);
+        struct pollfd pfd = {.fd = c->fd, .events = POLLOUT};
+        uint64_t ms = 0;
+
+        if (now >= c->wait_until_ns)
+            break;
+        ms = (c->wait_until_ns - now + NSEC_PER_MSEC - 1) / NSEC_PER_MSEC;
+        // EINTR is a stop signal: the final export still needs this message.
+        if (poll(&pfd, 1, ms > INT_MAX ? INT_MAX : (int)ms) < 0 && errno != EINTR)
+            return -1;
+        n = send(c->fd, msg, len, MSG_DONTWAIT);
+    }
+    return n;
+}
+
 static int send_templates(const struct collector *c, collector_templates_fn templates, void *ctx) {
     uint8_t buf[TEMPLATE_MSG_MAX];
     size_t n = 0;
 
     for (unsigned i = 0; (n = templates(ctx, i, buf, sizeof(buf))) != 0; i++)
-        if (send(c->fd, buf, n, MSG_DONTWAIT) < 0)
+        if (send_msg(c, buf, n) < 0)
             return -1;
     return 0;
 }
@@ -106,14 +129,14 @@ int collector_export(struct collector *c, const void *msg, size_t len, collector
 
     if (c->templates_due && !send_templates(c, templates, ctx))
         c->templates_due = false;
-    n = send(c->fd, msg, len, MSG_DONTWAIT);
+    n = send_msg(c, msg, len);
     if (n < 0 && errno == ECONNREFUSED) {
         if (!c->refused)
             log_msg("collector %s: port unreachable, the collector is down or restarting", c->name);
         c->refused = true;
         // While it is still down, the templates draw the next refusal, which this send then reports.
         (void)send_templates(c, templates, ctx);
-        n = send(c->fd, msg, len, MSG_DONTWAIT);
+        n = send_msg(c, msg, len);
     }
     if (n < 0) {
         const int err = errno;
@@ -154,7 +177,7 @@ int collector_open(const char *spec, char *err, size_t errlen) {
         (void)snprintf(err, errlen, "collector %s: %s", spec, gai_strerror(rc));
         return -1;
     }
-    // Non-blocking: a collector that does not keep up must never stall the one-second tick.
+    // Non-blocking: a slow collector stalls the tick only until the collector_export() deadline.
     // Connected: the route is looked up once, and errors are reported per collector. Every
     // address is tried: an IPv6 address first in the list may have no route on this host.
     for (const struct addrinfo *cur = ai; cur; cur = cur->ai_next) {

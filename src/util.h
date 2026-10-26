@@ -14,6 +14,7 @@
 #define TCXFLOW_VERSION "v1.1.0" ///< release version, the same as its git tag; the Makefile reads it from here
 
 constexpr uint64_t NSEC_PER_SEC = 1'000'000'000; ///< nanoseconds per second
+constexpr uint64_t NSEC_PER_MSEC = 1'000'000;    ///< nanoseconds per millisecond
 
 /**
  * Log a message to stderr (journald when run by systemd), prefixed with "tcxflow: ".

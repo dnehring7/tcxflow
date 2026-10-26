@@ -262,7 +262,8 @@ collectors are not affected. tcxflow logs when a collector refuses or messages c
 and when it is reachable again. Messages are sized to fit the path MTU towards every collector
 (112 to 1400 bytes; 464 if it is unknown, for 512-byte packets as RFC 7011 asks), so exporting
 through a VPN or tunnel does not fragment them. Below 284 bytes the templates go in messages
-of their own.
+of their own. When many flows end at once and a socket buffer fills up, tcxflow waits for the
+collector up to 200 ms per second, and up to 5 seconds for the final export at shutdown.
 
 How the counting works:
 
